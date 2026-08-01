@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-login"
+version = "1.0.0"
+description = "Switch between multiple Claude Code accounts from one terminal"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["claude", "claude-code", "cli", "accounts", "oauth"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.scripts]
+claude-login = "claude_login.cli:main"
+ccl = "claude_login.cli:main"
+
+[tool.setuptools]
+packages = ["claude_login"]
+
+[tool.setuptools.package-data]
+claude_login = ["py.typed"]

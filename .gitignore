@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.eggs/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.idea/
+.DS_Store
+
+# Personal Claude Code permission grants for this checkout.
+.claude/settings.local.json
