@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from . import claude_cli, ui
+from . import claude_app, claude_cli, ui
 from .errors import ProfileNotFound, UsageError
 
 REGISTRY_VERSION = 1
@@ -68,6 +68,19 @@ SEEDED_CONFIG_KEYS = [
 #: A refresh token closer than this to expiry gets flagged in `list`.
 EXPIRY_WARNING_DAYS = 3
 
+#: Launch targets `claude-login` knows how to hand a session over to.
+LAUNCH_TARGETS = ("cli", "app", "ask")
+
+#: Where the shared pool of app chats lives, relative to the vault root.
+APP_SHARED_DIRNAME = "app-shared"
+#: Only the Code tab's index is pooled.  ``local-agent-mode-sessions`` looks
+#: similar and is deliberately left alone: its leaf is not an index but a whole
+#: workspace (``cowork_plugins``, ``backups``, ``rpm``, its own ``.claude.json``,
+#: nested per-account directories), and its first level is not always an account
+#: uuid — ``skills-plugin`` lives there too.  Merging that across accounts mixes
+#: state that has nothing to do with chat history.
+POOL_DIRNAMES = {claude_app.SESSIONS_DIRNAME: "ccd-sessions"}
+
 
 def vault_root() -> Path:
     override = os.environ.get("CLAUDE_ACCOUNTS_HOME")
@@ -107,6 +120,11 @@ class Profile:
     created_at: Optional[str] = None
     last_used_at: Optional[str] = None
     extra_args: list[str] = field(default_factory=list)
+    #: ``CLAUDE_USER_DATA_DIR`` for the desktop app; filled in on first app launch.
+    app_data_dir: Optional[str] = None
+    #: Cached organisation uuid — half of the key the app names its chat
+    #: directory with. Only the API knows it, so it is worth remembering.
+    org_uuid: Optional[str] = None
 
     @property
     def is_default(self) -> bool:
@@ -129,6 +147,8 @@ class Profile:
             "createdAt": self.created_at,
             "lastUsedAt": self.last_used_at,
             "extraArgs": self.extra_args,
+            "appDataDir": self.app_data_dir,
+            "orgUuid": self.org_uuid,
         }
 
     @classmethod
@@ -143,6 +163,8 @@ class Profile:
             created_at=data.get("createdAt"),
             last_used_at=data.get("lastUsedAt"),
             extra_args=list(data.get("extraArgs") or []),
+            app_data_dir=data.get("appDataDir"),
+            org_uuid=data.get("orgUuid"),
         )
 
 
@@ -162,6 +184,26 @@ class Status:
     @property
     def prunable(self) -> bool:
         return self.state in ("expired", "logged-out", "missing")
+
+
+@dataclass
+class PoolPlan:
+    """What wiring the app's chat pool did — or would do, for a dry run."""
+
+    moved: int = 0
+    linked: int = 0
+    collisions: int = 0
+    backup: Optional[str] = None
+    #: Links created ahead of the app, before it had a directory of its own.
+    prelinked: int = 0
+    #: Leaves folded in while the app had them open, copy-then-swap.
+    live: int = 0
+    #: Leaves left alone because we could not tell what a live window was using.
+    skipped: int = 0
+    #: Chats parked because their transcript is no longer on disk.
+    orphans: int = 0
+    #: Entries left in place because they are not chat files, so not ours to move.
+    unmoved: list[str] = field(default_factory=list)
 
 
 # --- vault -----------------------------------------------------------------
@@ -206,6 +248,17 @@ class Vault:
         data.setdefault("defaultHidden", False)
         # No launch flags unless the user configures some (Settings, or `flags`).
         data.setdefault("launchArgs", [])
+        # App support stays off the beaten path until the user picks it: a fresh
+        # install keeps launching the CLI, exactly as launchArgs stays empty.
+        data.setdefault("launchTarget", "cli")
+        data.setdefault("appShared", list(claude_app.DEFAULT_APP_SHARED))
+        data.setdefault("appEnv", {})
+        data.setdefault("appPerAccount", True)
+        # An absent account list means "every account"; an empty one means none.
+        # The old boolean only had the second meaning worth keeping.
+        legacy = data.pop("appSessionsShared", None)
+        if legacy is False:
+            data.setdefault("appSharedAccounts", [])
         self._data = data
         self._loaded = True
         return self
@@ -217,6 +270,97 @@ class Vault:
 
     def set_launch_args(self, args: list[str]) -> None:
         self._data["launchArgs"] = list(args)
+
+    # -- app settings -------------------------------------------------------
+
+    @property
+    def launch_target(self) -> str:
+        value = self.load()._data.get("launchTarget")
+        return value if value in LAUNCH_TARGETS else "cli"
+
+    def set_launch_target(self, target: str) -> None:
+        if target not in LAUNCH_TARGETS:
+            raise UsageError(
+                f"unknown launch target {target!r} — pick one of {', '.join(LAUNCH_TARGETS)}"
+            )
+        self._data["launchTarget"] = target
+
+    @property
+    def app_shared(self) -> list[str]:
+        value = self.load()._data.get("appShared")
+        return [str(item) for item in value] if isinstance(value, list) else []
+
+    def set_app_shared(self, entries: list[str]) -> None:
+        self._data["appShared"] = list(entries)
+
+    @property
+    def app_env(self) -> dict[str, str]:
+        value = self.load()._data.get("appEnv")
+        if not isinstance(value, dict):
+            return {}
+        return {str(key): str(item) for key, item in value.items()}
+
+    def set_app_env(self, env: dict[str, str]) -> None:
+        self._data["appEnv"] = dict(env)
+
+    def _account_list(self, key: str) -> Optional[list[str]]:
+        """``None`` when the key is absent, which everywhere means "all of them".
+
+        Keeping absence distinct from an empty list is what lets a fresh install
+        do the obvious thing while still allowing "nobody" to be chosen.
+        """
+        value = self.load()._data.get(key)
+        return [str(item) for item in value] if isinstance(value, list) else None
+
+    @property
+    def app_open_accounts(self) -> Optional[list[str]]:
+        return self._account_list("appOpenAccounts")
+
+    def set_app_open_accounts(self, names: Optional[list[str]]) -> None:
+        if names is None:
+            self._data.pop("appOpenAccounts", None)
+        else:
+            self._data["appOpenAccounts"] = list(names)
+
+    @property
+    def app_shared_accounts(self) -> Optional[list[str]]:
+        return self._account_list("appSharedAccounts")
+
+    def set_app_shared_accounts(self, names: Optional[list[str]]) -> None:
+        if names is None:
+            self._data.pop("appSharedAccounts", None)
+        else:
+            self._data["appSharedAccounts"] = list(names)
+
+    def shares_chats(self, profile: Profile) -> bool:
+        selected = self.app_shared_accounts
+        return True if selected is None else profile.name in selected
+
+    @property
+    def sharing_enabled(self) -> bool:
+        """False only when the user has unticked every account."""
+        selected = self.app_shared_accounts
+        return selected is None or bool(selected)
+
+    def sharing_account_uuids(self) -> Optional[set[str]]:
+        """Account uuids allowed into the pool; ``None`` means no restriction.
+
+        Chat directories are named by account uuid, so membership has to be
+        answered in those terms — a data directory can hold leaves belonging to
+        several accounts, and an unticked one stays private even there.
+        """
+        selected = self.app_shared_accounts
+        if selected is None:
+            return None
+        chosen = set(selected)
+        return {p.account_uuid for p in self.profiles if p.name in chosen and p.account_uuid}
+
+    @property
+    def app_per_account(self) -> bool:
+        return bool(self.load()._data.get("appPerAccount", True))
+
+    def set_app_per_account(self, value: bool) -> None:
+        self._data["appPerAccount"] = bool(value)
 
     def save(self) -> None:
         self.ensure_dirs()
@@ -356,6 +500,22 @@ class Vault:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         return str(path)
 
+    def app_dir_for(self, name: str) -> Path:
+        return self.profiles_dir / name / "app-data"
+
+    def app_data_dir_for(self, profile: Profile) -> str:
+        """Which user-data directory the app should run against for this profile.
+
+        The machine-wide directory plays the part ``~/.claude`` plays for the
+        CLI: it belongs to the ``default`` profile and is never moved.
+        """
+        if profile.is_default or not self.app_per_account:
+            return claude_app.default_app_support_dir()
+        return profile.app_data_dir or str(self.app_dir_for(profile.name))
+
+    def pool_dir(self, kind: str) -> Path:
+        return self.root / APP_SHARED_DIRNAME / POOL_DIRNAMES[kind]
+
     def link_shared(self, profile: Profile, *, repair: bool = False) -> tuple[list[str], list[str]]:
         """Symlink shared entries from ``~/.claude`` into the profile directory.
 
@@ -369,12 +529,42 @@ class Vault:
         """
         if profile.is_default or not profile.config_dir:
             return [], []
-        source_root = Path(claude_cli.default_config_dir())
-        target_root = Path(profile.config_dir)
+        return self._link_entries(
+            Path(claude_cli.default_config_dir()),
+            Path(profile.config_dir),
+            self.shared,
+            repair=repair,
+        )
+
+    def link_app_shared(
+        self, profile: Profile, *, repair: bool = False
+    ) -> tuple[list[str], list[str]]:
+        """The same idea for the app: link its heavy, account-neutral entries.
+
+        ``config.json`` is never in the list — it carries the account's token,
+        which is exactly what has to stay private to each profile.
+        """
+        if profile.is_default or not self.app_per_account:
+            return [], []
+        return self._link_entries(
+            Path(claude_app.default_app_support_dir()),
+            Path(self.app_data_dir_for(profile)),
+            self.app_shared,
+            repair=repair,
+        )
+
+    def _link_entries(
+        self,
+        source_root: Path,
+        target_root: Path,
+        entries: list[str],
+        *,
+        repair: bool = False,
+    ) -> tuple[list[str], list[str]]:
         target_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         linked: list[str] = []
         conflicts: list[str] = []
-        for entry in self.shared:
+        for entry in entries:
             source = source_root / entry
             target = target_root / entry
             if not source.exists():
@@ -402,10 +592,26 @@ class Vault:
         """Inspect shared entries without touching anything: (missing, diverged)."""
         if profile.is_default or not profile.config_dir:
             return [], []
-        source_root = Path(claude_cli.default_config_dir())
-        target_root = Path(profile.config_dir)
+        return self._entry_conflicts(
+            Path(claude_cli.default_config_dir()), Path(profile.config_dir), self.shared
+        )
+
+    def app_shared_conflicts(self, profile: Profile) -> tuple[list[str], list[str]]:
+        """The same inspection for the app's shared entries."""
+        if profile.is_default or not self.app_per_account:
+            return [], []
+        return self._entry_conflicts(
+            Path(claude_app.default_app_support_dir()),
+            Path(self.app_data_dir_for(profile)),
+            self.app_shared,
+        )
+
+    @staticmethod
+    def _entry_conflicts(
+        source_root: Path, target_root: Path, entries: list[str]
+    ) -> tuple[list[str], list[str]]:
         missing, diverged = [], []
-        for entry in self.shared:
+        for entry in entries:
             source = source_root / entry
             target = target_root / entry
             if not source.exists():
@@ -415,6 +621,275 @@ class Vault:
             elif not target.is_symlink() and not _same_content(target, source):
                 diverged.append(entry)
         return missing, diverged
+
+    # -- the app's shared chat pool -----------------------------------------
+
+    def wire_session_pool(
+        self,
+        data_dir: str,
+        *,
+        dry_run: bool = False,
+        backup: bool = True,
+        live_account: Optional[str] = None,
+        sharing: Optional[set[str]] = None,
+    ) -> PoolPlan:
+        """Point every ``<accountUuid>/<orgUuid>`` chat directory at one pool.
+
+        The app looks its chats up under the *current* account's uuid, which is
+        why they seem to vanish after signing in as somebody else.  Collapsing
+        every leaf directory onto a single pool makes the same Recents list show
+        up whichever account is signed in.
+
+        A leaf only exists once the app has resolved an account, so this is the
+        lazy path too: call it again later and whatever the app created in the
+        meantime is folded in.
+
+        ``live_account`` names the account a window is signed in as right now.
+        Its leaf is the only one the app writes to, so that one is folded in with
+        the copy-then-swap dance rather than moved; everything else in the same
+        directory is dormant and moves outright.
+
+        ``sharing`` limits the pool to a set of account uuids; ``None`` lets all
+        of them in.  The filter is per leaf rather than per directory because one
+        data directory can hold leaves of several accounts.
+        """
+        plan = PoolPlan()
+        for kind in POOL_DIRNAMES:
+            agent = kind == claude_app.AGENT_SESSIONS_DIRNAME
+            pending = [
+                leaf
+                for leaf in claude_app.session_leaf_dirs(data_dir, agent=agent)
+                if not leaf.is_symlink()
+                and (sharing is None or leaf.parent.name in sharing)
+            ]
+            if not pending:
+                continue
+            if backup and not dry_run and plan.backup is None:
+                plan.backup = self._backup_sessions(data_dir)
+            pool = self.pool_dir(kind)
+            if not dry_run:
+                pool.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for leaf in pending:
+                live = bool(live_account) and leaf.parent.name == live_account
+                if dry_run:
+                    moved, collisions = self._drain_into_pool(leaf, pool, dry_run=True)
+                elif live:
+                    moved, collisions = self._drain_live_into_pool(leaf, pool)
+                    plan.live += 1
+                else:
+                    moved, collisions = self._drain_into_pool(leaf, pool, dry_run=False)
+                    leftover = sorted(p.name for p in leaf.iterdir())
+                    if leftover:
+                        # Never delete what we did not move. A leaf holding
+                        # anything but chat files is not the index we think it
+                        # is, and guessing there once cost real data.
+                        plan.unmoved.extend(f"{leaf.name}/{name}" for name in leftover)
+                        continue
+                    leaf.rmdir()
+                    leaf.symlink_to(pool)
+                plan.moved += moved
+                plan.collisions += collisions
+                plan.linked += 1
+        return plan
+
+    def sweep_pool(self, *, dry_run: bool = False) -> int:
+        """Move chats whose transcript is gone out of the shared pool.
+
+        The app's chat index and the transcripts it points at have different
+        lifetimes: an index entry can outlive its ``~/.claude/projects`` file by
+        machines and months.  Pooling such an entry puts a row in everybody's
+        Recents that can only answer "session not found on disk", so it is parked
+        in ``app-shared/orphans`` instead — kept, because it is still the user's
+        data, just not shown.
+        """
+        alive = claude_cli.transcript_ids(None)
+        attic = self.root / APP_SHARED_DIRNAME / "orphans"
+        moved = 0
+        for kind in POOL_DIRNAMES:
+            pool = self.pool_dir(kind)
+            try:
+                entries = sorted(pool.iterdir())
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.suffix != ".json" or not entry.name.startswith(
+                    claude_app.SESSION_PREFIX
+                ):
+                    continue
+                session = claude_app.read_session(entry)
+                cli_id = session.get("cliSessionId")
+                if not isinstance(cli_id, str) or cli_id in alive:
+                    continue
+                moved += 1
+                if dry_run:
+                    continue
+                attic.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.move(str(entry), str(attic / entry.name))
+        return moved
+
+    def link_session_pool(self, data_dir: str, account_uuid: str, org_uuid: str) -> int:
+        """Create the ``<accountUuid>/<orgUuid>`` links before the app does.
+
+        The app makes that directory only once it has resolved an account — which
+        happens after a login, long after we have exec'd away — so waiting for it
+        to appear means a fresh profile comes up with an empty Recents list and
+        no obvious moment when it starts sharing.  Knowing both uuids lets the
+        link exist before the app ever looks.
+
+        Directories that are already real are left alone: folding their contents
+        in is ``wire_session_pool``'s job, and it knows how to back them up.
+        """
+        if not account_uuid or not org_uuid:
+            return 0
+        linked = 0
+        for kind in POOL_DIRNAMES:
+            agent = kind == claude_app.AGENT_SESSIONS_DIRNAME
+            root = claude_app.sessions_root(data_dir, agent=agent)
+            leaf = root / account_uuid / org_uuid
+            if leaf.is_symlink() or leaf.exists():
+                continue
+            pool = self.pool_dir(kind)
+            pool.mkdir(mode=0o700, parents=True, exist_ok=True)
+            leaf.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            try:
+                leaf.symlink_to(pool)
+            except OSError:
+                continue
+            linked += 1
+        return linked
+
+    def known_org_uuids(self, data_dir: str, account_uuid: str) -> list[str]:
+        """Organisation uuids this account already has a chat directory under.
+
+        Cheaper and more reliable than asking the API, and it works offline: the
+        name is right there on disk, whether the entry is a real directory or a
+        link we made earlier.  Agent-mode counts — the two live under the same
+        organisation.
+        """
+        found: list[str] = []
+        for agent in (False, True):
+            for leaf in claude_app.session_leaf_dirs(data_dir, agent=agent):
+                if leaf.parent.name == account_uuid and leaf.name not in found:
+                    found.append(leaf.name)
+        return found
+
+    def unwire_session_pool(self, data_dir: str) -> int:
+        """Undo the wiring: hand the profile back its own copy of the chats."""
+        restored = 0
+        for kind in POOL_DIRNAMES:
+            agent = kind == claude_app.AGENT_SESSIONS_DIRNAME
+            pool = self.pool_dir(kind)
+            for leaf in claude_app.session_leaf_dirs(data_dir, agent=agent):
+                if not leaf.is_symlink():
+                    continue
+                leaf.unlink()
+                leaf.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if pool.is_dir():
+                    for entry in pool.iterdir():
+                        if entry.is_file():
+                            shutil.copy2(entry, leaf / entry.name)
+                restored += 1
+        return restored
+
+    def _backup_sessions(self, data_dir: str) -> str:
+        """Copy the chat directories aside before the very first move."""
+        destination = self.root / APP_SHARED_DIRNAME / f".backup-{ui.now_ms()}"
+        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        for kind in POOL_DIRNAMES:
+            source = Path(data_dir) / kind
+            if source.is_dir():
+                shutil.copytree(source, destination / kind, symlinks=True)
+        return str(destination)
+
+    def _drain_into_pool(
+        self, leaf: Path, pool: Path, *, dry_run: bool
+    ) -> tuple[int, int]:
+        """Move one leaf directory's files into the pool; newer wins a clash."""
+        moved = collisions = 0
+        try:
+            entries = sorted(leaf.iterdir())
+        except OSError:
+            return 0, 0
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            target = pool / entry.name
+            if target.exists():
+                collisions += 1
+                if dry_run:
+                    continue
+                if self._is_newer(entry, target):
+                    self._park_loser(target)
+                    shutil.move(str(entry), str(target))
+                else:
+                    self._park_loser(entry)
+                continue
+            moved += 1
+            if not dry_run:
+                shutil.move(str(entry), str(target))
+        return moved, collisions
+
+    def _copy_into_pool(self, source: Path, pool: Path) -> tuple[int, int]:
+        """Copy one directory's chat files into the pool; newer wins a clash."""
+        copied = collisions = 0
+        try:
+            entries = sorted(source.iterdir())
+        except OSError:
+            return 0, 0
+        for entry in entries:
+            if not entry.is_file():
+                continue
+            target = pool / entry.name
+            if target.exists():
+                if not self._is_newer(entry, target):
+                    continue
+                collisions += 1
+                self._park_loser(target)
+            else:
+                copied += 1
+            try:
+                shutil.copy2(entry, target)
+            except OSError:
+                continue
+        return copied, collisions
+
+    def _drain_live_into_pool(self, leaf: Path, pool: Path) -> tuple[int, int]:
+        """Fold a directory the app is writing to *right now* into the pool.
+
+        Copy first, then swap the directory for the symlink in two syscalls, then
+        copy again to catch whatever was written in between.  Nothing is deleted:
+        the original directory stays on disk next to its old place, so even a
+        write that lost the race is still there to be found.
+
+        Moving the files outright would be simpler, but it would mean telling
+        somebody to quit the window they are working in — and that is a worse
+        trade than a sub-millisecond race that cannot lose data.
+        """
+        copied, collisions = self._copy_into_pool(leaf, pool)
+        aside = leaf.with_name(f"{leaf.name}{claude_app.REPLACED_MARKER}{ui.now_ms()}")
+        leaf.rename(aside)
+        leaf.symlink_to(pool)
+        late, more = self._copy_into_pool(aside, pool)
+        return copied + late, collisions + more
+
+    @staticmethod
+    def _is_newer(candidate: Path, incumbent: Path) -> bool:
+        def stamp(path: Path) -> int:
+            recorded = claude_app.activity(claude_app.read_session(path))
+            if recorded:
+                return recorded
+            try:
+                return int(path.stat().st_mtime * 1000)
+            except OSError:
+                return 0
+
+        return stamp(candidate) > stamp(incumbent)
+
+    def _park_loser(self, path: Path) -> None:
+        """Keep the chat that lost a name clash instead of deleting it."""
+        attic = self.root / APP_SHARED_DIRNAME / "collisions"
+        attic.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.move(str(path), str(attic / f"{path.stem}.{ui.now_ms()}{path.suffix}"))
 
     @staticmethod
     def _shadow(target_root: Path, entry: str, target: Path) -> Path:
@@ -477,6 +952,51 @@ class Vault:
         if changed:
             self._write_global_config(profile, updated)
         return changed
+
+    def gather_config(self) -> list[str]:
+        """Pull MCP servers the profiles have but the machine-wide config lacks.
+
+        ``sync_config`` only ever flows machine-wide → profile, so a server
+        installed while working inside a profile never reached the others.  This
+        is the missing direction, and it only ever *adds*: a name already in the
+        machine-wide config wins, and a server deleted there does not come back
+        from a profile that still has it.
+
+        Returns the names that were added.
+        """
+        machine = claude_cli.read_global_config(None)
+        servers = dict(machine.get("mcpServers") or {})
+        added: list[str] = []
+        for profile in self.profiles:
+            if profile.is_default or not profile.config_dir:
+                continue
+            found = claude_cli.read_global_config(profile.config_dir).get("mcpServers")
+            if not isinstance(found, dict):
+                continue
+            for name, definition in found.items():
+                if name not in servers:
+                    servers[name] = definition
+                    added.append(name)
+        if added:
+            self._write_machine_config({**machine, "mcpServers": servers})
+        return added
+
+    @staticmethod
+    def _write_machine_config(data: dict[str, Any]) -> None:
+        """Write ``~/.claude.json`` with the same atomic dance as a profile's."""
+        target = claude_cli.global_config_path(None)
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".claude-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, ensure_ascii=False)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _write_global_config(profile: Profile, data: dict[str, Any]) -> None:

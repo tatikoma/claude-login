@@ -8,22 +8,51 @@ only runs when ``CLAUDE_LOGIN_INTEGRATION=1`` is set.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from claude_login import claude_cli, cli, commands, keychain, store, ui, usage  # noqa: E402
+from claude_login import (  # noqa: E402
+    claude_app,
+    claude_cli,
+    cli,
+    commands,
+    keychain,
+    store,
+    ui,
+    usage,
+)
 from claude_login.cli import split_args  # noqa: E402
-from claude_login.errors import UsageError  # noqa: E402
+from claude_login.errors import ClaudeAppError, UsageError  # noqa: E402
 from claude_login.store import Profile, Vault  # noqa: E402
+
+
+@contextlib.contextmanager
+def _env_var(key: str, value: Optional[str]):
+    """Set (or clear with None) an environment variable for the duration."""
+    original = os.environ.get(key)
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        if original is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original
 
 FAKE_CLAUDE = '''#!/usr/bin/env python3
 """Stand-in for the real `claude` CLI: just enough auth surface to test against."""
@@ -501,18 +530,18 @@ class TestSettingsEditing(Base):
         )
 
     def test_settings_rows_line_up_with_the_rendered_items(self):
-        self.assertEqual(len(commands._SETTINGS_ROWS), len(commands._settings_items(self.vault)))
+        self.assertEqual(len(commands._FLAGS_ROWS), len(commands._flags_items(self.vault)))
 
     def test_rendered_rows_reflect_the_stored_flags(self):
         commands._save_launch_args(self.vault, ["--continue", "--effort", "high"])
-        cells = [ui.strip_ansi(item.cells[2]) for item in commands._settings_items(self.vault)]
+        cells = [ui.strip_ansi(item.cells[2]) for item in commands._flags_items(self.vault)]
         self.assertEqual(cells[:3], ["off", "on", "high"])
 
     def test_title_previews_the_command_line(self):
         commands._save_launch_args(self.vault, ["--continue"])
-        self.assertIn("claude --continue", ui.strip_ansi(commands._settings_title(self.vault)))
+        self.assertIn("claude --continue", ui.strip_ansi(commands._flags_title(self.vault)))
         commands._save_launch_args(self.vault, [])
-        self.assertIn("no flags", ui.strip_ansi(commands._settings_title(self.vault)))
+        self.assertIn("no flags", ui.strip_ansi(commands._flags_title(self.vault)))
 
 
 class TestContinueFlag(Base):
@@ -866,6 +895,1284 @@ class TestUsageRendering(unittest.TestCase):
         self.assertEqual(usage._style(70), ("yellow",))
         self.assertEqual(usage._style(90), ("red",))
         self.assertEqual(usage._style(100), ("red", "bold"))
+
+
+class TestAppRegistry(Base):
+    def test_fresh_vault_defaults_to_the_cli(self):
+        self.assertEqual(self.vault.launch_target, "cli")
+
+    def test_launch_target_round_trip(self):
+        with self.vault.locked():
+            self.vault.set_launch_target("app")
+            self.vault.save()
+        self.assertEqual(self.vault.reload().launch_target, "app")
+
+    def test_invalid_launch_target_falls_back_to_cli(self):
+        with self.vault.locked():
+            self.vault._data["launchTarget"] = "nonsense"
+            self.vault.save()
+        self.assertEqual(self.vault.reload().launch_target, "cli")
+
+    def test_unknown_target_cannot_be_set(self):
+        with self.assertRaises(UsageError):
+            self.vault.load().set_launch_target("browser")
+
+    def test_app_shared_defaults_to_the_built_in_list(self):
+        self.assertEqual(self.vault.app_shared, claude_app.DEFAULT_APP_SHARED)
+
+    def test_app_env_defaults_to_empty_and_round_trips(self):
+        self.assertEqual(self.vault.app_env, {})
+        with self.vault.locked():
+            self.vault.set_app_env({"FOO": "bar"})
+            self.vault.save()
+        self.assertEqual(self.vault.reload().app_env, {"FOO": "bar"})
+
+    def test_sessions_are_shared_and_per_account_by_default(self):
+        self.assertIsNone(self.vault.app_shared_accounts)
+        self.assertIsNone(self.vault.app_open_accounts)
+        self.assertTrue(self.vault.sharing_enabled)
+        self.assertTrue(self.vault.app_per_account)
+
+    def test_app_data_dir_for_a_profile(self):
+        profile = self.add(email="one@example.com")
+        self.assertEqual(
+            self.vault.app_data_dir_for(profile),
+            str(self.vault.root / "profiles" / profile.name / "app-data"),
+        )
+
+    def test_default_profile_uses_the_machine_wide_app_dir(self):
+        profile = Profile(name="default", config_dir=None)
+        self.assertEqual(
+            self.vault.app_data_dir_for(profile), claude_app.default_app_support_dir()
+        )
+
+    def test_per_account_off_sends_everyone_to_the_machine_wide_dir(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            self.vault.set_app_per_account(False)
+            self.vault.save()
+        self.assertEqual(
+            self.vault.reload().app_data_dir_for(profile),
+            claude_app.default_app_support_dir(),
+        )
+
+    def test_org_uuid_round_trips_through_the_registry(self):
+        profile = self.add(email="one@example.com")
+        profile.org_uuid = "org-1"
+        with self.vault.locked():
+            self.vault.upsert(profile)
+            self.vault.save()
+        self.assertEqual(self.vault.reload().get(profile.name).org_uuid, "org-1")
+
+
+class _AppBase(Base):
+    """Base with a stand-in for the machine-wide app support directory."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.app_support = self.tmp / "app-support"
+        self.app_support.mkdir()
+        self._env("CLAUDE_LOGIN_APP_SUPPORT", str(self.app_support))
+
+    def fake_bundle(self) -> Path:
+        bundle = self.tmp / "Fake.app"
+        binary = bundle / claude_app.BINARY_SUBPATH
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        self._env("CLAUDE_LOGIN_APP_PATH", str(bundle))
+        return bundle
+
+    def leaf(self, data_dir: Path, account: str, org: str, *, agent=False) -> Path:
+        kind = (
+            claude_app.AGENT_SESSIONS_DIRNAME if agent else claude_app.SESSIONS_DIRNAME
+        )
+        leaf = data_dir / kind / account / org
+        leaf.mkdir(parents=True)
+        return leaf
+
+    @staticmethod
+    def chat(leaf: Path, name: str, activity: int = 0) -> Path:
+        path = leaf / f"{name}.json"
+        path.write_text(json.dumps({"sessionId": name, "lastActivityAt": activity}))
+        return path
+
+
+class TestAppSharedLinks(_AppBase):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.app_support / "claude-code" / "2.1.0").mkdir(parents=True)
+        (self.app_support / "Claude Extensions").mkdir()
+        (self.app_support / "claude_desktop_config.json").write_text('{"mcpServers":{}}')
+        (self.app_support / "config.json").write_text('{"oauth:tokenCacheV2":"djEw"}')
+
+    def test_heavy_entries_are_symlinked(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            linked, conflicts = self.vault.link_app_shared(profile)
+        target = Path(self.vault.app_data_dir_for(profile))
+        self.assertEqual(conflicts, [])
+        self.assertIn("claude-code", linked)
+        self.assertTrue((target / "claude-code").is_symlink())
+        self.assertTrue((target / "Claude Extensions").is_symlink())
+
+    def test_the_token_bearing_config_is_never_shared(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            self.vault.link_app_shared(profile)
+        target = Path(self.vault.app_data_dir_for(profile))
+        self.assertFalse((target / "config.json").exists())
+
+    def test_missing_sources_are_skipped_quietly(self):
+        shutil.rmtree(self.app_support / "claude-code")
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            linked, conflicts = self.vault.link_app_shared(profile)
+        self.assertNotIn("claude-code", linked)
+        self.assertEqual(conflicts, [])
+
+    def test_identical_private_copy_is_relinked_silently(self):
+        profile = self.add(email="one@example.com")
+        target = Path(self.vault.app_data_dir_for(profile))
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (target / "claude_desktop_config.json").write_text('{"mcpServers":{}}')
+        with self.vault.locked():
+            _, conflicts = self.vault.link_app_shared(profile)
+        self.assertEqual(conflicts, [])
+        self.assertTrue((target / "claude_desktop_config.json").is_symlink())
+
+    def test_diverged_copy_is_reported_not_clobbered(self):
+        profile = self.add(email="one@example.com")
+        target = Path(self.vault.app_data_dir_for(profile))
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (target / "claude_desktop_config.json").write_text('{"mine":true}')
+        with self.vault.locked():
+            _, conflicts = self.vault.link_app_shared(profile)
+        self.assertIn("claude_desktop_config.json", conflicts)
+        self.assertEqual(
+            (target / "claude_desktop_config.json").read_text(), '{"mine":true}'
+        )
+
+    def test_repair_shadows_the_diverged_copy(self):
+        profile = self.add(email="one@example.com")
+        target = Path(self.vault.app_data_dir_for(profile))
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (target / "claude_desktop_config.json").write_text('{"mine":true}')
+        with self.vault.locked():
+            _, conflicts = self.vault.link_app_shared(profile, repair=True)
+        self.assertEqual(conflicts, [])
+        self.assertTrue((target / "claude_desktop_config.json").is_symlink())
+        self.assertTrue(list((target / ".shadowed").iterdir()))
+
+    def test_default_profile_is_the_source_not_a_target(self):
+        profile = Profile(name="default", config_dir=None)
+        with self.vault.locked():
+            self.assertEqual(self.vault.link_app_shared(profile), ([], []))
+
+    def test_profile_directory_is_private(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            self.vault.link_app_shared(profile)
+        mode = Path(self.vault.app_data_dir_for(profile)).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o700)
+
+    def test_conflicts_are_reported_without_touching_anything(self):
+        profile = self.add(email="one@example.com")
+        target = Path(self.vault.app_data_dir_for(profile))
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (target / "claude_desktop_config.json").write_text('{"mine":true}')
+        missing, diverged = self.vault.app_shared_conflicts(profile)
+        self.assertIn("claude-code", missing)
+        self.assertIn("claude_desktop_config.json", diverged)
+
+
+class TestSessionPool(_AppBase):
+    def test_existing_chats_move_into_the_pool(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        plan = self.vault.wire_session_pool(str(self.app_support))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "local_one.json").is_file())
+        self.assertTrue(leaf.is_symlink())
+        self.assertEqual(os.path.realpath(leaf), os.path.realpath(pool))
+        self.assertEqual(plan.moved, 1)
+
+    def test_two_accounts_end_up_in_one_pool(self):
+        first = self.leaf(self.app_support, "acct-a", "org-1")
+        second = self.leaf(self.app_support, "acct-b", "org-2")
+        self.chat(first, "local_one", 10)
+        self.chat(second, "local_two", 20)
+        self.vault.wire_session_pool(str(self.app_support))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertEqual(
+            sorted(p.name for p in pool.iterdir()),
+            ["local_one.json", "local_two.json"],
+        )
+
+    def test_backup_is_taken_before_the_first_move(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        plan = self.vault.wire_session_pool(str(self.app_support))
+        self.assertIsNotNone(plan.backup)
+        self.assertTrue(list(Path(plan.backup).rglob("local_one.json")))
+
+    def test_dry_run_changes_nothing(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        plan = self.vault.wire_session_pool(str(self.app_support), dry_run=True)
+        self.assertEqual(plan.moved, 1)
+        self.assertFalse(leaf.is_symlink())
+        self.assertTrue((leaf / "local_one.json").is_file())
+        self.assertFalse(self.vault.pool_dir(claude_app.SESSIONS_DIRNAME).exists())
+
+    def test_running_twice_is_idempotent(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        self.vault.wire_session_pool(str(self.app_support))
+        again = self.vault.wire_session_pool(str(self.app_support))
+        self.assertEqual(again.moved, 0)
+        self.assertTrue(leaf.is_symlink())
+
+    def test_collision_keeps_the_newer_chat(self):
+        first = self.leaf(self.app_support, "acct-a", "org-1")
+        second = self.leaf(self.app_support, "acct-b", "org-2")
+        self.chat(first, "local_same", 10)
+        self.chat(second, "local_same", 99)
+        plan = self.vault.wire_session_pool(str(self.app_support))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        kept = json.loads((pool / "local_same.json").read_text())
+        self.assertEqual(kept["lastActivityAt"], 99)
+        self.assertEqual(plan.collisions, 1)
+
+    def test_the_loser_of_a_clash_is_kept_aside(self):
+        first = self.leaf(self.app_support, "acct-a", "org-1")
+        second = self.leaf(self.app_support, "acct-b", "org-2")
+        self.chat(first, "local_same", 10)
+        self.chat(second, "local_same", 99)
+        self.vault.wire_session_pool(str(self.app_support))
+        attic = self.vault.root / store.APP_SHARED_DIRNAME / "collisions"
+        self.assertTrue(list(attic.iterdir()))
+
+    def test_lazily_adopts_a_directory_the_app_created_later(self):
+        self.vault.wire_session_pool(str(self.app_support))
+        leaf = self.leaf(self.app_support, "acct-new", "org-9")
+        self.chat(leaf, "local_late", 5)
+        self.vault.wire_session_pool(str(self.app_support))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "local_late.json").is_file())
+        self.assertTrue(leaf.is_symlink())
+
+    def test_only_the_code_tab_index_is_pooled(self):
+        self.assertEqual(list(store.POOL_DIRNAMES), [claude_app.SESSIONS_DIRNAME])
+
+    def test_nothing_to_do_when_the_app_has_never_run(self):
+        plan = self.vault.wire_session_pool(str(self.app_support))
+        self.assertEqual((plan.moved, plan.linked, plan.collisions), (0, 0, 0))
+        self.assertIsNone(plan.backup)
+
+    def test_unwiring_returns_the_chats_to_the_profile(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        self.vault.wire_session_pool(str(self.app_support))
+        self.assertEqual(self.vault.unwire_session_pool(str(self.app_support)), 1)
+        self.assertFalse(leaf.is_symlink())
+        self.assertTrue((leaf / "local_one.json").is_file())
+
+    def test_a_directory_inside_a_leaf_is_never_deleted(self):
+        """The bug this guards cost real data: a leaf holding a whole workspace
+        had its subdirectories removed because only files were moved."""
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        workspace = leaf / "cowork_plugins" / "marketplaces"
+        workspace.mkdir(parents=True)
+        (workspace / "keep-me.txt").write_text("precious")
+        plan = self.vault.wire_session_pool(str(self.app_support))
+        self.assertTrue((workspace / "keep-me.txt").is_file())
+        self.assertFalse(leaf.is_symlink())
+        self.assertTrue(any("cowork_plugins" in entry for entry in plan.unmoved))
+
+    def test_agent_mode_sessions_are_left_alone_entirely(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org-1", agent=True)
+        self.chat(leaf, "local_agent", 1)
+        (leaf / "rpm").mkdir()
+        self.vault.wire_session_pool(str(self.app_support))
+        self.assertFalse(leaf.is_symlink())
+        self.assertTrue((leaf / "local_agent.json").is_file())
+        self.assertTrue((leaf / "rpm").is_dir())
+
+    def test_scheduled_tasks_travel_with_the_chats(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        (leaf / "scheduled-tasks.json").write_text("{}")
+        self.vault.wire_session_pool(str(self.app_support))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "scheduled-tasks.json").is_file())
+
+
+class TestOrgUuidLookup(Base):
+    def test_org_uuid_is_read_from_the_profile_endpoint(self):
+        profile = self.add(email="one@example.com")
+        captured = {}
+
+        def fake_request(path, *, token=None, payload=None):
+            captured["path"] = path
+            captured["token"] = token
+            return 200, {"organization": {"uuid": "org-42"}}
+
+        self._patch(usage, "_request", fake_request)
+        self.assertEqual(usage.fetch_org_uuid(profile), "org-42")
+        self.assertEqual(captured["path"], usage.PROFILE_PATH)
+        self.assertTrue(captured["token"])
+
+    def test_failure_returns_none_rather_than_raising(self):
+        profile = self.add(email="one@example.com")
+        self._patch(usage, "_request", lambda *a, **k: (0, None))
+        self.assertIsNone(usage.fetch_org_uuid(profile))
+
+    def test_a_malformed_uuid_is_rejected(self):
+        profile = self.add(email="one@example.com")
+        self._patch(usage, "_request", lambda *a, **k: (200, {"organization": {"uuid": 7}}))
+        self.assertIsNone(usage.fetch_org_uuid(profile))
+
+
+class TestAppCommands(_AppBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self._patch(claude_app, "running_pids", lambda: [])
+        self._patch(claude_app, "running_data_dirs", set)
+        self._patch(claude_app, "is_in_use", lambda _dir: False)
+
+    def test_adopt_dry_run_touches_nothing(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        self.chat(leaf, "local_one")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=True, yes=True))
+        self.assertFalse(leaf.is_symlink())
+
+    def test_adopt_moves_chats_into_the_pool(self):
+        # No profiles at all: the chats that matter most predate the tool, and
+        # they live in the machine-wide directory.
+        self.assertEqual(self.vault.profiles, [])
+        leaf = self.leaf(self.app_support, "acct", "org")
+        self.chat(leaf, "local_one")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        self.assertTrue(leaf.is_symlink())
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "local_one.json").is_file())
+
+    def test_pool_link_is_created_before_the_app_exists(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            stored = self.vault.get(profile.name)
+            stored.account_uuid, stored.org_uuid = "acct-x", "org-y"
+            self.vault.upsert(stored)
+            self.vault.save()
+        commands.cmd_app_link(
+            self.vault.reload(), argparse.Namespace(name=profile.name)
+        )
+        leaf = (
+            Path(self.vault.app_data_dir_for(profile))
+            / claude_app.SESSIONS_DIRNAME
+            / "acct-x"
+            / "org-y"
+        )
+        self.assertTrue(leaf.is_symlink())
+        self.assertEqual(
+            os.path.realpath(leaf),
+            os.path.realpath(self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)),
+        )
+
+    def test_org_uuid_is_learnt_from_a_directory_on_disk(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            stored = self.vault.get(profile.name)
+            stored.account_uuid = "acct-x"
+            self.vault.upsert(stored)
+            self.vault.save()
+        self.leaf(self.app_support, "acct-x", "org-from-disk")
+        resolved = commands.resolve_org_uuid(
+            self.vault.reload(), self.vault.get(profile.name)
+        )
+        self.assertEqual(resolved, "org-from-disk")
+        self.assertEqual(self.vault.reload().get(profile.name).org_uuid, "org-from-disk")
+
+    def test_link_reports_when_the_org_is_unknown(self):
+        profile = self.add(email="one@example.com")
+        self._patch(usage, "fetch_org_uuid", lambda _p: None)
+        commands.cmd_app_link(self.vault, argparse.Namespace(name=profile.name))
+        data_dir = Path(self.vault.app_data_dir_for(profile))
+        self.assertEqual(claude_app.session_leaf_dirs(str(data_dir)), [])
+
+    def _transcript(self, session_id: str) -> None:
+        project = self.home_claude / "projects" / "-w"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / f"{session_id}.jsonl").write_text('{"type":"user"}\n')
+
+    def test_a_chat_without_a_transcript_is_kept_out_of_the_pool(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        alive = leaf / "local_alive.json"
+        alive.write_text(json.dumps({"sessionId": "local_alive", "cliSessionId": "live-1"}))
+        dead = leaf / "local_dead.json"
+        dead.write_text(json.dumps({"sessionId": "local_dead", "cliSessionId": "gone-1"}))
+        self._transcript("live-1")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "local_alive.json").is_file())
+        self.assertFalse((pool / "local_dead.json").exists())
+        attic = self.vault.root / store.APP_SHARED_DIRNAME / "orphans"
+        self.assertTrue((attic / "local_dead.json").is_file())
+
+    def test_an_empty_transcript_does_not_count_as_alive(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        (leaf / "local_dead.json").write_text(
+            json.dumps({"sessionId": "local_dead", "cliSessionId": "empty-1"})
+        )
+        project = self.home_claude / "projects" / "-w"
+        project.mkdir(parents=True, exist_ok=True)
+        (project / "empty-1.jsonl").write_text("")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertFalse((pool / "local_dead.json").exists())
+
+    def test_a_chat_without_a_cli_session_id_is_left_alone(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        self.chat(leaf, "local_plain")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "local_plain.json").is_file())
+
+    def test_sweep_dry_run_moves_nothing(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        (leaf / "local_dead.json").write_text(
+            json.dumps({"sessionId": "local_dead", "cliSessionId": "gone-1"})
+        )
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=True, yes=True))
+        self.assertFalse(
+            (self.vault.root / store.APP_SHARED_DIRNAME / "orphans").exists()
+        )
+
+    def test_pending_labels_flag_unpooled_chats(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        self.chat(leaf, "local_one")
+        self.assertEqual(commands.pending_pool_labels(self.vault), ["machine-wide"])
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        self.assertEqual(commands.pending_pool_labels(self.vault), [])
+
+    def test_data_dirs_always_start_with_the_machine_wide_one(self):
+        self.add(email="one@example.com")
+        labels = [label for label, _ in commands.app_data_dirs(self.vault)]
+        self.assertEqual(labels[0], "machine-wide")
+        self.assertEqual(len(labels), 2)
+
+    def test_data_dirs_collapse_duplicates(self):
+        self.add(email="one@example.com")
+        with self.vault.locked():
+            self.vault.set_app_per_account(False)
+            self.vault.save()
+        self.assertEqual(len(commands.app_data_dirs(self.vault.reload())), 1)
+
+    def _signed_in_as(self, account: str) -> None:
+        (self.app_support / "config.json").write_text(
+            json.dumps({"oauth:tokenCacheV2": "djEw", "lastKnownAccountUuid": account})
+        )
+        self._patch(claude_app, "is_in_use", lambda _dir: True)
+
+    def test_the_signed_in_accounts_chats_are_folded_in_by_copy(self):
+        leaf = self.leaf(self.app_support, "acct-live", "org")
+        self.chat(leaf, "local_one")
+        self._signed_in_as("acct-live")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue(leaf.is_symlink())
+        self.assertTrue((pool / "local_one.json").is_file())
+
+    def test_the_original_of_a_live_directory_is_kept(self):
+        leaf = self.leaf(self.app_support, "acct-live", "org")
+        self.chat(leaf, "local_one")
+        self._signed_in_as("acct-live")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        aside = [
+            p for p in leaf.parent.iterdir() if p.name.startswith("org.replaced-")
+        ]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / "local_one.json").is_file())
+
+    def test_a_dormant_account_moves_while_another_is_signed_in(self):
+        live = self.leaf(self.app_support, "acct-live", "org")
+        dormant = self.leaf(self.app_support, "acct-dormant", "org")
+        self.chat(live, "local_live")
+        self.chat(dormant, "local_dormant")
+        self._signed_in_as("acct-live")
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue(dormant.is_symlink())
+        self.assertTrue(live.is_symlink())
+        self.assertEqual(
+            sorted(p.name for p in pool.iterdir()),
+            ["local_dormant.json", "local_live.json"],
+        )
+        # The dormant one was moved, the live one only copied.
+        self.assertFalse(list(dormant.parent.glob("org.replaced-*")))
+        self.assertTrue(list(live.parent.glob("org.replaced-*")))
+
+    def test_an_unreadable_signed_in_account_stops_everything(self):
+        leaf = self.leaf(self.app_support, "acct-a", "org")
+        self.chat(leaf, "local_one")
+        # In use, but config.json says nothing about who is signed in.
+        self._patch(claude_app, "is_in_use", lambda _dir: True)
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        self.assertFalse(leaf.is_symlink())
+
+    def test_a_free_profile_is_pooled_while_another_stays_open(self):
+        machine_leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(machine_leaf, "local_machine")
+        profile = self.add(email="one@example.com")
+        profile_dir = Path(self.vault.app_data_dir_for(profile))
+        profile_leaf = self.leaf(profile_dir, "acct-b", "org-2")
+        self.chat(profile_leaf, "local_profile")
+        busy = os.path.normpath(str(self.app_support))
+        self._patch(
+            claude_app, "is_in_use", lambda path: os.path.normpath(path) == busy
+        )
+        commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
+        self.assertFalse(machine_leaf.is_symlink())
+        self.assertTrue(profile_leaf.is_symlink())
+
+    def test_adopt_is_a_no_op_when_there_is_nothing_to_pool(self):
+        self.assertEqual(
+            commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True)),
+            0,
+        )
+
+    def test_status_runs_without_profiles(self):
+        self.assertEqual(commands.cmd_app_status(self.vault, argparse.Namespace()), 0)
+
+    def test_status_lists_a_profile(self):
+        self.add(email="one@example.com")
+        self.assertEqual(commands.cmd_app_status(self.vault, argparse.Namespace()), 0)
+
+    def test_relink_repairs_a_missing_link(self):
+        (self.app_support / "claude-code").mkdir()
+        profile = self.add(email="one@example.com")
+        commands.cmd_app_relink(self.vault, argparse.Namespace(name=None, force=False))
+        data_dir = Path(self.vault.app_data_dir_for(profile))
+        self.assertTrue((data_dir / "claude-code").is_symlink())
+
+    def test_app_subcommand_dispatches(self):
+        args = cli.build_parser().parse_args(["app", "adopt", "--dry-run"])
+        self.assertIs(args.func, commands.cmd_app_adopt)
+        self.assertTrue(args.dry_run)
+
+    def test_bare_app_shows_status(self):
+        argv, _ = split_args(["app"])
+        args = cli.build_parser().parse_args(argv)
+        self.assertIs(args.func, commands.cmd_app_status)
+
+    def test_chats_state_reports_private_before_pooling(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        self.chat(leaf, "local_one")
+        state = commands._chats_state(self.vault, str(self.app_support))
+        self.assertEqual(ui.strip_ansi(state), "private")
+
+    def test_doctor_mentions_the_app(self):
+        self.add(email="one@example.com")
+        self.assertEqual(commands.cmd_doctor(self.vault, argparse.Namespace()), 0)
+
+
+class TestSettingsSections(Base):
+    def test_target_row_cycles_through_the_targets(self):
+        self.assertEqual(commands.cycle_target("cli"), "app")
+        self.assertEqual(commands.cycle_target("app"), "ask")
+        self.assertEqual(commands.cycle_target("ask"), "cli")
+
+    def test_section_rows_describe_the_current_state(self):
+        rows = commands._settings_sections(self.vault)
+        self.assertEqual(len(rows), len(commands.SETTINGS_SECTIONS))
+        self.assertEqual(ui.strip_ansi(rows[0].cells[1]), "CLI")
+        self.assertEqual(ui.strip_ansi(rows[1].cells[1]), "none")
+        self.assertIn("sharing chats", ui.strip_ansi(rows[2].cells[1]))
+
+    def test_app_rows_count_the_chosen_accounts(self):
+        self.add(email="one@example.com")
+        rows = commands._app_settings_items(self.vault.reload())
+        self.assertEqual(len(rows), len(commands._APP_SETTINGS_ROWS))
+        self.assertEqual(ui.strip_ansi(rows[1].cells[1]), "1 of 1")
+        with self.vault.locked():
+            self.vault.set_app_shared_accounts([])
+            self.vault.save()
+        rows = commands._app_settings_items(self.vault.reload())
+        self.assertEqual(ui.strip_ansi(rows[2].cells[1]), "0 of 1")
+
+    def test_env_parsing_ignores_junk(self):
+        self.assertEqual(
+            commands.parse_env("FOO=bar nonsense BAZ=qux ="), {"FOO": "bar", "BAZ": "qux"}
+        )
+
+    def test_env_parsing_keeps_an_empty_value(self):
+        self.assertEqual(commands.parse_env("FOO="), {"FOO": ""})
+
+
+class TestLaunchTarget(Base):
+    @staticmethod
+    def _args(**kwargs) -> argparse.Namespace:
+        return argparse.Namespace(**kwargs)
+
+    def _target(self, value: str) -> Vault:
+        with self.vault.locked():
+            self.vault.set_launch_target(value)
+            self.vault.save()
+        return self.vault.reload()
+
+    def test_registry_default_is_the_cli(self):
+        self.assertEqual(commands.resolve_target(self.vault, self._args()), "cli")
+
+    def test_registry_can_prefer_the_app(self):
+        self.assertEqual(commands.resolve_target(self._target("app"), self._args()), "app")
+
+    def test_app_flag_wins_over_the_registry(self):
+        self.assertEqual(commands.resolve_target(self.vault, self._args(app=True)), "app")
+
+    def test_cli_flag_wins_over_the_registry(self):
+        self.assertEqual(
+            commands.resolve_target(self._target("app"), self._args(cli=True)), "cli"
+        )
+
+    def test_ask_falls_back_to_the_cli_without_a_terminal(self):
+        self.assertEqual(commands.resolve_target(self._target("ask"), self._args()), "cli")
+
+    def test_base_target_never_asks(self):
+        self.assertEqual(commands.base_target(self._target("ask"), self._args()), "cli")
+
+    def test_other_target_flips(self):
+        self.assertEqual(commands.other_target("cli"), "app")
+        self.assertEqual(commands.other_target("app"), "cli")
+
+    def test_app_flag_survives_the_subcommand_split(self):
+        self.assertEqual(split_args(["--app", "work"]), (["--app", "use", "work"], []))
+
+    def test_target_flag_after_the_name_is_still_ours(self):
+        argv, _ = split_args(["work", "--app"])
+        args = cli.build_parser().parse_args(argv)
+        self.assertTrue(getattr(args, "app", False))
+        self.assertEqual(list(args.claude_args or []), [])
+
+    def test_root_level_flag_is_not_clobbered_by_the_subparser(self):
+        argv, _ = split_args(["--app", "work"])
+        args = cli.build_parser().parse_args(argv)
+        self.assertTrue(getattr(args, "app", False))
+
+    def test_an_explicit_separator_still_forwards_the_flag(self):
+        self.assertEqual(
+            cli.hoist_target_flags(["work", "--", "--app"]), ["work", "--", "--app"]
+        )
+
+    def test_other_trailing_flags_stay_passthrough(self):
+        argv, _ = split_args(["work", "--app", "--resume"])
+        args = cli.build_parser().parse_args(argv)
+        self.assertTrue(getattr(args, "app", False))
+        self.assertEqual(list(args.claude_args or []), ["--resume"])
+
+
+class TestAppLaunch(_AppBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake_bundle()
+        self.spawned = []
+        self._patch(claude_app, "launch", self._record_launch)
+        self._patch(claude_app, "running_pids", lambda: [])
+        self._patch(claude_app, "running_data_dirs", set)
+        self._patch(claude_app, "is_in_use", lambda _dir: False)
+
+    def _record_launch(self, data_dir, extra_env=None):
+        self.spawned.append((data_dir, dict(extra_env or {})))
+        return 4242
+
+    def test_launch_uses_the_profiles_own_data_dir(self):
+        profile = self.add(email="one@example.com")
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        self.assertEqual(self.spawned[0][0], self.vault.app_data_dir_for(profile))
+
+    def test_configured_env_reaches_the_app(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            self.vault.set_app_env({"FOO": "bar"})
+            self.vault.save()
+        commands.launch_app(self.vault.reload(), profile, argparse.Namespace())
+        self.assertEqual(self.spawned[0][1], {"FOO": "bar"})
+
+    def test_the_data_directory_and_shared_links_are_prepared(self):
+        (self.app_support / "claude-code").mkdir()
+        profile = self.add(email="one@example.com")
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        data_dir = Path(self.vault.app_data_dir_for(profile))
+        self.assertTrue(data_dir.is_dir())
+        self.assertTrue((data_dir / "claude-code").is_symlink())
+
+    def test_launch_prelinks_the_pool_for_a_brand_new_profile(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            stored = self.vault.get(profile.name)
+            stored.account_uuid, stored.org_uuid = "acct-x", "org-y"
+            self.vault.upsert(stored)
+            self.vault.save()
+        profile = self.vault.reload().get(profile.name)
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        leaf = (
+            Path(self.vault.app_data_dir_for(profile))
+            / claude_app.SESSIONS_DIRNAME
+            / "acct-x"
+            / "org-y"
+        )
+        self.assertTrue(leaf.is_symlink())
+
+    def test_the_data_dir_is_remembered_in_the_registry(self):
+        profile = self.add(email="one@example.com")
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        stored = self.vault.reload().get(profile.name)
+        self.assertEqual(stored.app_data_dir, self.vault.app_data_dir_for(profile))
+
+    def test_launching_records_the_profile_as_last_used(self):
+        profile = self.add(email="one@example.com")
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        self.assertEqual(self.vault.reload().last_used, profile.name)
+
+    def test_chats_left_in_the_profile_are_pooled_on_launch(self):
+        profile = self.add(email="one@example.com")
+        data_dir = Path(self.vault.app_data_dir_for(profile))
+        leaf = self.leaf(data_dir, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "local_one.json").is_file())
+        self.assertTrue(leaf.is_symlink())
+
+    def test_pooling_is_skipped_while_this_profile_is_open(self):
+        self._patch(claude_app, "is_in_use", lambda _dir: True)
+        profile = self.add(email="one@example.com")
+        data_dir = Path(self.vault.app_data_dir_for(profile))
+        leaf = self.leaf(data_dir, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        self.assertFalse(leaf.is_symlink())
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_a_missing_bundle_is_reported(self):
+        self._env("CLAUDE_LOGIN_APP_PATH", str(self.tmp / "Absent.app"))
+        profile = self.add(email="one@example.com")
+        with self.assertRaises(ClaudeAppError):
+            commands.launch_app(self.vault, profile, argparse.Namespace())
+
+    def test_dispatch_sends_the_app_target_to_the_app(self):
+        profile = self.add(email="one@example.com")
+        commands.dispatch(self.vault, profile, argparse.Namespace(), "app")
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_app_target_does_not_require_a_usable_cli_login(self):
+        profile = self.add(email="one@example.com")
+        claude_cli.delete_credentials(profile.config_dir)
+        self.invalidate()
+        self.assertEqual(self.vault.status(profile).state, "logged-out")
+        args = argparse.Namespace(name=profile.name, app=True, yes=True, claude_args=[])
+        self.assertEqual(commands.cmd_use(self.vault, args), 0)
+        self.assertEqual(len(self.spawned), 1)
+
+
+class TestAppLayout(unittest.TestCase):
+    def test_bundle_override_is_honoured(self):
+        with _env_var("CLAUDE_LOGIN_APP_PATH", "/tmp/Other.app"):
+            self.assertEqual(claude_app.app_bundle(), "/tmp/Other.app")
+
+    def test_support_dir_override_is_honoured(self):
+        with _env_var("CLAUDE_LOGIN_APP_SUPPORT", "/tmp/support"):
+            self.assertEqual(claude_app.default_app_support_dir(), "/tmp/support")
+
+    def test_missing_bundle_is_an_error(self):
+        with _env_var("CLAUDE_LOGIN_APP_PATH", "/tmp/nope-does-not-exist.app"):
+            with self.assertRaises(ClaudeAppError):
+                claude_app.find_app()
+            self.assertFalse(claude_app.available())
+
+    def test_our_own_replaced_backup_is_not_a_leaf(self):
+        tmp = Path(tempfile.mkdtemp(prefix="app-leaves-"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = tmp / claude_app.SESSIONS_DIRNAME / "acct"
+        (root / "org").mkdir(parents=True)
+        (root / f"org{claude_app.REPLACED_MARKER}123").mkdir()
+        (root / ".hidden").mkdir()
+        leaves = claude_app.session_leaf_dirs(str(tmp))
+        self.assertEqual([leaf.name for leaf in leaves], ["org"])
+
+    def test_sessions_root_is_keyed_off_the_data_dir(self):
+        self.assertEqual(claude_app.sessions_root("/d"), Path("/d/claude-code-sessions"))
+        self.assertEqual(
+            claude_app.sessions_root("/d", agent=True),
+            Path("/d/local-agent-mode-sessions"),
+        )
+
+
+class TestAppEnv(unittest.TestCase):
+    def test_data_dir_is_exported(self):
+        self.assertEqual(claude_app.child_env("/data")["CLAUDE_USER_DATA_DIR"], "/data")
+
+    def test_none_clears_the_variable(self):
+        with _env_var("CLAUDE_USER_DATA_DIR", "/stale"):
+            self.assertNotIn("CLAUDE_USER_DATA_DIR", claude_app.child_env(None))
+
+    def test_config_dir_is_dropped_so_transcripts_stay_shared(self):
+        with _env_var("CLAUDE_CONFIG_DIR", "/some/profile"):
+            self.assertNotIn("CLAUDE_CONFIG_DIR", claude_app.child_env("/data"))
+
+    def test_ambient_credentials_are_dropped(self):
+        with _env_var("ANTHROPIC_API_KEY", "sk-ant-nope"):
+            self.assertNotIn("ANTHROPIC_API_KEY", claude_app.child_env("/data"))
+
+    def test_extra_env_is_applied_last(self):
+        self.assertEqual(claude_app.child_env("/data", {"FOO": "bar"})["FOO"], "bar")
+
+
+class TestAppStatus(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="app-status-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _config(self, payload: dict) -> str:
+        (self.tmp / "config.json").write_text(json.dumps(payload))
+        return str(self.tmp)
+
+    def test_missing_directory(self):
+        self.assertEqual(claude_app.app_status(str(self.tmp / "nope")).state, "missing")
+
+    def test_directory_without_a_token(self):
+        status = claude_app.app_status(self._config({"locale": "en-US"}))
+        self.assertEqual(status.state, "logged-out")
+        self.assertFalse(status.signed_in)
+
+    def test_token_cache_means_signed_in(self):
+        status = claude_app.app_status(
+            self._config(
+                {"oauth:tokenCacheV2": "djEw...", "lastKnownAccountUuid": "uuid-a"}
+            )
+        )
+        self.assertEqual(status.state, "signed-in")
+        self.assertEqual(status.account_uuid, "uuid-a")
+
+    def test_legacy_token_key_is_accepted(self):
+        status = claude_app.app_status(self._config({"oauth:tokenCache": "djEw"}))
+        self.assertTrue(status.signed_in)
+
+    def test_empty_token_does_not_count(self):
+        status = claude_app.app_status(self._config({"oauth:tokenCacheV2": ""}))
+        self.assertFalse(status.signed_in)
+
+
+class TestAppContinue(unittest.TestCase):
+    def setUp(self) -> None:
+        self.pool = Path(tempfile.mkdtemp(prefix="app-pool-"))
+        self.addCleanup(shutil.rmtree, self.pool, ignore_errors=True)
+
+    def _session(self, name: str, **fields) -> None:
+        payload = {"sessionId": name, "cwd": "/work", **fields}
+        (self.pool / f"{name}.json").write_text(json.dumps(payload))
+
+    def test_newest_by_last_focused_wins(self):
+        self._session("local_a", lastFocusedAt=100)
+        self._session("local_b", lastFocusedAt=300)
+        self._session("local_c", lastFocusedAt=200)
+        self.assertEqual(claude_app.last_session(self.pool)["sessionId"], "local_b")
+
+    def test_falls_back_to_last_activity(self):
+        self._session("local_a", lastActivityAt=500)
+        self.assertEqual(claude_app.last_session(self.pool)["sessionId"], "local_a")
+
+    def test_archived_sessions_are_skipped(self):
+        self._session("local_a", lastFocusedAt=100)
+        self._session("local_b", lastFocusedAt=900, isArchived=True)
+        self.assertEqual(claude_app.last_session(self.pool)["sessionId"], "local_a")
+
+    def test_cwd_filter(self):
+        self._session("local_a", lastFocusedAt=100, cwd="/work")
+        self._session("local_b", lastFocusedAt=900, cwd="/elsewhere")
+        self.assertEqual(
+            claude_app.last_session(self.pool, cwd="/work")["sessionId"], "local_a"
+        )
+
+    def test_no_sessions_at_all(self):
+        self.assertIsNone(claude_app.last_session(self.pool))
+
+    def test_non_session_files_are_ignored(self):
+        (self.pool / "scheduled-tasks.json").write_text("{}")
+        self.assertIsNone(claude_app.last_session(self.pool))
+
+
+class TestAccountSelection(_AppBase):
+    def test_absent_key_means_every_account(self):
+        profile = self.add(email="one@example.com")
+        self.assertIsNone(self.vault.app_shared_accounts)
+        self.assertTrue(self.vault.shares_chats(profile))
+        self.assertIsNone(self.vault.sharing_account_uuids())
+
+    def test_empty_list_means_nobody(self):
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            self.vault.set_app_shared_accounts([])
+            self.vault.save()
+        vault = self.vault.reload()
+        self.assertFalse(vault.shares_chats(profile))
+        self.assertFalse(vault.sharing_enabled)
+        self.assertEqual(vault.sharing_account_uuids(), set())
+
+    def test_the_old_boolean_migrates_to_an_empty_list(self):
+        with self.vault.locked():
+            self.vault._data["appSessionsShared"] = False
+            self.vault.save()
+        vault = self.vault.reload()
+        self.assertEqual(vault.app_shared_accounts, [])
+        self.assertNotIn("appSessionsShared", vault._data)
+
+    def test_the_old_boolean_true_leaves_the_default(self):
+        with self.vault.locked():
+            self.vault._data["appSessionsShared"] = True
+            self.vault.save()
+        self.assertIsNone(self.vault.reload().app_shared_accounts)
+
+    def test_a_stale_name_does_not_break_the_count(self):
+        self.add(email="one@example.com")
+        with self.vault.locked():
+            self.vault.set_app_open_accounts(["gone@example.com"])
+            self.vault.save()
+        self.assertEqual(commands._chosen_count(self.vault.reload(), ["gone@example.com"]), "0 of 1")
+
+    def test_sharing_uuids_only_cover_ticked_accounts(self):
+        first = self.add(email="one@example.com")
+        second = self.add(email="two@example.com")
+        with self.vault.locked():
+            self.vault.set_app_shared_accounts([first.name])
+            self.vault.save()
+        uuids = self.vault.reload().sharing_account_uuids()
+        self.assertIn(first.account_uuid, uuids)
+        self.assertNotIn(second.account_uuid, uuids)
+
+    def test_toggling_a_name_adds_and_removes(self):
+        self.assertEqual(commands.toggled(["a"], "b"), ["a", "b"])
+        self.assertEqual(commands.toggled(["a", "b"], "a"), ["b"])
+
+
+class TestPerAccountSharing(_AppBase):
+    def test_an_unticked_account_stays_private_in_the_machine_dir(self):
+        shared = self.leaf(self.app_support, "acct-shared", "org")
+        private = self.leaf(self.app_support, "acct-private", "org")
+        self.chat(shared, "local_shared")
+        self.chat(private, "local_private")
+        plan = self.vault.wire_session_pool(
+            str(self.app_support), sharing={"acct-shared"}
+        )
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertTrue((pool / "local_shared.json").is_file())
+        self.assertFalse((pool / "local_private.json").exists())
+        self.assertTrue(shared.is_symlink())
+        self.assertFalse(private.is_symlink())
+        self.assertEqual(plan.linked, 1)
+
+    def test_none_lets_everybody_in(self):
+        first = self.leaf(self.app_support, "acct-a", "org")
+        second = self.leaf(self.app_support, "acct-b", "org")
+        self.chat(first, "local_a")
+        self.chat(second, "local_b")
+        self.vault.wire_session_pool(str(self.app_support), sharing=None)
+        self.assertTrue(first.is_symlink())
+        self.assertTrue(second.is_symlink())
+
+
+class TestAppOpen(_AppBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake_bundle()
+        self.opened = []
+        self._patch(claude_app, "launch", lambda d, e=None: self.opened.append(d) or 1)
+        self._patch(claude_app, "running_pids", lambda: [])
+        self._patch(claude_app, "running_data_dirs", set)
+        self._patch(claude_app, "is_in_use", lambda _dir: False)
+        self._patch(commands, "LAUNCH_STAGGER_SECONDS", 0)
+
+    def test_opens_every_account_by_default(self):
+        self.add(email="one@example.com")
+        self.add(email="two@example.com")
+        commands.cmd_app_open(self.vault.reload(), argparse.Namespace(names=[]))
+        self.assertEqual(len(self.opened), 2)
+
+    def test_respects_the_configured_list(self):
+        first = self.add(email="one@example.com")
+        self.add(email="two@example.com")
+        with self.vault.locked():
+            self.vault.set_app_open_accounts([first.name])
+            self.vault.save()
+        commands.cmd_app_open(self.vault.reload(), argparse.Namespace(names=[]))
+        self.assertEqual(self.opened, [self.vault.app_data_dir_for(first)])
+
+    def test_arguments_beat_the_configured_list(self):
+        first = self.add(email="one@example.com")
+        second = self.add(email="two@example.com")
+        with self.vault.locked():
+            self.vault.set_app_open_accounts([first.name])
+            self.vault.save()
+        commands.cmd_app_open(
+            self.vault.reload(), argparse.Namespace(names=[second.name])
+        )
+        self.assertEqual(self.opened, [self.vault.app_data_dir_for(second)])
+
+    def test_an_already_open_account_is_skipped(self):
+        self.add(email="one@example.com")
+        self._patch(claude_app, "is_in_use", lambda _dir: True)
+        commands.cmd_app_open(self.vault.reload(), argparse.Namespace(names=[]))
+        self.assertEqual(self.opened, [])
+
+    def test_a_stale_name_is_skipped_not_fatal(self):
+        self.add(email="one@example.com")
+        commands.cmd_app_open(
+            self.vault.reload(), argparse.Namespace(names=["gone@example.com"])
+        )
+        self.assertEqual(self.opened, [])
+
+
+class TestGatherMcp(Base):
+    def _servers(self, config_dir, servers: dict) -> None:
+        current = claude_cli.read_global_config(config_dir)
+        path = claude_cli.global_config_path(config_dir)
+        path.write_text(json.dumps({**current, "mcpServers": servers}))
+
+    def test_a_server_added_in_a_profile_reaches_the_machine_config(self):
+        profile = self.add(email="one@example.com")
+        self._servers(profile.config_dir, {"local-tool": {"command": "run-me"}})
+        with self.vault.locked():
+            added = self.vault.gather_config()
+            self.vault.save()
+        self.assertEqual(added, ["local-tool"])
+        machine = claude_cli.read_global_config(None)
+        self.assertIn("local-tool", machine["mcpServers"])
+
+    def test_the_machine_config_wins_on_a_name_clash(self):
+        profile = self.add(email="one@example.com")
+        self._servers(None, {"tool": {"command": "machine"}})
+        self._servers(profile.config_dir, {"tool": {"command": "profile"}})
+        with self.vault.locked():
+            self.vault.gather_config()
+            self.vault.save()
+        machine = claude_cli.read_global_config(None)
+        self.assertEqual(machine["mcpServers"]["tool"]["command"], "machine")
+
+    def test_gathering_then_syncing_spreads_it_to_the_others(self):
+        first = self.add(email="one@example.com")
+        second = self.add(email="two@example.com")
+        self._servers(first.config_dir, {"local-tool": {"command": "run-me"}})
+        commands.cmd_sync(self.vault, argparse.Namespace(name=None, gather=True))
+        landed = claude_cli.read_global_config(second.config_dir)
+        self.assertIn("local-tool", landed.get("mcpServers", {}))
+
+    def test_plain_sync_does_not_gather(self):
+        profile = self.add(email="one@example.com")
+        self._servers(profile.config_dir, {"local-tool": {"command": "run-me"}})
+        commands.cmd_sync(self.vault, argparse.Namespace(name=None, gather=False))
+        self.assertNotIn(
+            "local-tool", claude_cli.read_global_config(None).get("mcpServers", {})
+        )
+
+
+class TestSyncAllAndSetup(_AppBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake_bundle()
+        self._patch(claude_app, "running_pids", lambda: [])
+        self._patch(claude_app, "running_data_dirs", set)
+        self._patch(claude_app, "is_in_use", lambda _dir: False)
+
+    def test_sync_all_runs_every_step(self):
+        self.add(email="one@example.com")
+        code = commands.cmd_sync_all(self.vault.reload(), argparse.Namespace(dry_run=False))
+        self.assertEqual(code, 0)
+
+    def test_a_failing_step_does_not_stop_the_others(self):
+        self.add(email="one@example.com")
+        calls = []
+
+        def boom(vault, args):
+            calls.append("relink")
+            raise ClaudeAppError("nope")
+
+        self._patch(commands, "cmd_relink", boom)
+        code = commands.cmd_sync_all(self.vault.reload(), argparse.Namespace(dry_run=False))
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, ["relink"])
+        # The pool step still ran despite the earlier failure.
+        self.assertTrue(self.vault.reload().pool_dir(claude_app.SESSIONS_DIRNAME) is not None)
+
+    def test_setup_says_its_piece_without_a_terminal(self):
+        self.assertEqual(commands.cmd_setup(self.vault, argparse.Namespace()), 0)
+
+    def test_setup_is_safe_to_repeat(self):
+        self.add(email="one@example.com")
+        self.assertEqual(commands.cmd_setup(self.vault.reload(), argparse.Namespace()), 0)
+        self.assertEqual(commands.cmd_setup(self.vault.reload(), argparse.Namespace()), 0)
+
+
+class TestSharedEntryEditing(_AppBase):
+    """The entries with spaces in their names are the whole point here.
+
+    A space-separated round trip once shredded ``Claude Extensions`` into
+    ``Claude`` and ``Extensions``, which matched nothing on disk, so the app's
+    extensions were silently never shared while every command reported success.
+    """
+
+    def test_defaults_contain_names_with_spaces(self):
+        with_spaces = [e for e in claude_app.DEFAULT_APP_SHARED if " " in e]
+        self.assertTrue(with_spaces, "the regression this guards needs such a name")
+
+    def test_toggling_keeps_names_with_spaces_intact(self):
+        entry = next(e for e in claude_app.DEFAULT_APP_SHARED if " " in e)
+        with self.vault.locked():
+            self.vault.set_app_shared(commands.toggled(self.vault.app_shared, entry))
+            self.vault.save()
+        after = self.vault.reload().app_shared
+        self.assertNotIn(entry, after)
+        self.assertNotIn("Claude", after)
+        with self.vault.locked():
+            self.vault.set_app_shared(commands.toggled(after, entry))
+            self.vault.save()
+        self.assertIn(entry, self.vault.reload().app_shared)
+
+    def test_choices_keep_configured_extras(self):
+        with self.vault.locked():
+            self.vault.set_app_shared([*claude_app.DEFAULT_APP_SHARED, "My Own Thing"])
+            self.vault.save()
+        choices = commands.shared_entry_choices(self.vault.reload())
+        self.assertIn("My Own Thing", choices)
+        self.assertEqual(len(choices), len(claude_app.DEFAULT_APP_SHARED) + 1)
+
+    def test_rows_mark_what_is_absent_on_this_machine(self):
+        (self.app_support / "claude-code").mkdir()
+        rows = commands._shared_items(self.vault)
+        labels = {
+            ui.strip_ansi(row.cells[1]): ui.strip_ansi(row.cells[2]) for row in rows
+        }
+        self.assertEqual(labels["claude-code"], "")
+        self.assertEqual(labels["Claude Extensions"], "not on this machine")
+
+    def test_an_entry_with_spaces_actually_gets_linked(self):
+        entry = "Claude Extensions"
+        (self.app_support / entry).mkdir(parents=True)
+        profile = self.add(email="one@example.com")
+        with self.vault.locked():
+            linked, _ = self.vault.link_app_shared(profile)
+        self.assertIn(entry, linked)
+        self.assertTrue((Path(self.vault.app_data_dir_for(profile)) / entry).is_symlink())
+
+
+class TestSyncAllRepairs(_AppBase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake_bundle()
+        self._patch(claude_app, "running_pids", lambda: [])
+        self._patch(claude_app, "running_data_dirs", set)
+        self._patch(claude_app, "is_in_use", lambda _dir: False)
+
+    def test_sync_all_resolves_a_private_copy(self):
+        (self.app_support / "claude_desktop_config.json").write_text('{"shared":true}')
+        profile = self.add(email="one@example.com")
+        data_dir = Path(self.vault.app_data_dir_for(profile))
+        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (data_dir / "claude_desktop_config.json").write_text('{"mine":true}')
+        code = commands.cmd_sync_all(
+            self.vault.reload(), argparse.Namespace(dry_run=False)
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue((data_dir / "claude_desktop_config.json").is_symlink())
+        self.assertTrue(list((data_dir / ".shadowed").iterdir()))
+
+    def test_relink_reports_a_problem_when_a_copy_survives(self):
+        (self.app_support / "claude_desktop_config.json").write_text('{"shared":true}')
+        profile = self.add(email="one@example.com")
+        data_dir = Path(self.vault.app_data_dir_for(profile))
+        data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (data_dir / "claude_desktop_config.json").write_text('{"mine":true}')
+        code = commands.cmd_app_relink(
+            self.vault.reload(), argparse.Namespace(name=None, force=False)
+        )
+        self.assertEqual(code, 1)
+
+
+class TestScripts(unittest.TestCase):
+    """The clickable wrappers must stay runnable and stay thin."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def scripts(self) -> list[Path]:
+        return sorted((self.ROOT / "scripts").glob("*.command"))
+
+    def test_every_script_is_present_and_executable(self):
+        names = {path.name for path in self.scripts()}
+        self.assertEqual(names, {name for name, _ in commands.SCRIPT_SUMMARY})
+        for path in self.scripts():
+            self.assertTrue(os.access(path, os.X_OK), f"{path.name} is not executable")
+
+    def test_every_script_only_calls_the_cli(self):
+        for path in self.scripts():
+            body = path.read_text()
+            self.assertTrue(body.startswith("#!/usr/bin/env bash"), path.name)
+            self.assertIn("./bin/claude-login", body)
+            self.assertIn('cd "$(dirname "${BASH_SOURCE[0]}")/.."', body)
+
+
+class TestNoPrivateData(unittest.TestCase):
+    """Guards the repository against personal data before it goes public.
+
+    Written once so that a pasted `list --json` or a debugging log cannot quietly
+    ship somebody's email or account uuid.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    SUFFIXES = {".py", ".md", ".sh", ".toml", ".command", ".json", ".txt", ".cfg"}
+    SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "build", "dist"}
+    #: Domains only ever used as examples in docs and tests.
+    PLACEHOLDER_DOMAINS = ("example.com", "x.io", "x.com", "corp.com", "home.com", "b.com")
+    #: The public OAuth client id of Claude Code, plus test fixtures.
+    ALLOWED_UUIDS = {
+        "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        "11111111-2222-3333-4444-555555555555",
+    }
+    EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+    HOME_RE = re.compile(r"/Users/(?!someone\b)[A-Za-z0-9._-]+")
+
+    def files(self):
+        for path in self.ROOT.rglob("*"):
+            if not path.is_file() or path.suffix not in self.SUFFIXES:
+                continue
+            if self.SKIP_DIRS & set(path.relative_to(self.ROOT).parts):
+                continue
+            yield path
+
+    def test_no_real_email_addresses(self):
+        found = {
+            f"{path.relative_to(self.ROOT)}: {hit}"
+            for path in self.files()
+            for hit in self.EMAIL_RE.findall(path.read_text(errors="replace"))
+            if not hit.endswith(self.PLACEHOLDER_DOMAINS)
+        }
+        self.assertEqual(found, set(), "real-looking email in the repository")
+
+    def test_no_unexpected_uuids(self):
+        found = {
+            f"{path.relative_to(self.ROOT)}: {hit}"
+            for path in self.files()
+            for hit in self.UUID_RE.findall(path.read_text(errors="replace"))
+            if hit not in self.ALLOWED_UUIDS
+        }
+        self.assertEqual(found, set(), "account uuid in the repository")
+
+    def test_no_absolute_home_paths(self):
+        found = {
+            f"{path.relative_to(self.ROOT)}: {hit}"
+            for path in self.files()
+            for hit in self.HOME_RE.findall(path.read_text(errors="replace"))
+        }
+        self.assertEqual(found, set(), "somebody's home directory in the repository")
 
 
 @unittest.skipUnless(
