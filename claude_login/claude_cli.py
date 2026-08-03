@@ -262,6 +262,35 @@ def has_transcript(config_dir: Optional[str], cwd: str) -> bool:
     return False
 
 
+def transcript_ids(config_dir: Optional[str] = None) -> set[str]:
+    """Every session id that has a non-empty transcript on disk.
+
+    Built in one pass because callers check hundreds of ids at a time: the app's
+    chat index outlives the transcripts it points at, and an entry whose
+    transcript is gone can only ever show "session not found".
+    """
+    base = storage_dir(config_dir) / "projects"
+    ids: set[str] = set()
+    try:
+        projects = list(base.iterdir())
+    except OSError:
+        return ids
+    for project in projects:
+        try:
+            entries = list(project.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.suffix != ".jsonl":
+                continue
+            try:
+                if entry.stat().st_size > 0:
+                    ids.add(entry.stem)
+            except OSError:
+                continue
+    return ids
+
+
 def oauth_tokens(credentials: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Pull the ``claudeAiOauth`` sub-object out of a credential blob."""
     if not credentials:

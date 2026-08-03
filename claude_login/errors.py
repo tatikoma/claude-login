@@ -26,6 +26,10 @@ class ClaudeCliError(ClaudeLoginError):
     """The `claude` executable is missing or misbehaved."""
 
 
+class ClaudeAppError(ClaudeLoginError):
+    """The Claude desktop app is missing or cannot be launched."""
+
+
 class ProfileNotFound(UsageError):
     def __init__(self, name: str):
         super().__init__(f"no profile named {name!r} (run `claude-login list`)")

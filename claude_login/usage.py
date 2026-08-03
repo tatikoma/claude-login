@@ -29,6 +29,7 @@ from . import claude_cli, ui
 
 BASE_API_URL = os.environ.get("CLAUDE_LOGIN_API_BASE", "https://api.anthropic.com")
 USAGE_PATH = "/api/oauth/usage"
+PROFILE_PATH = "/api/oauth/profile"
 TOKEN_PATH = "/v1/oauth/token"
 CLIENT_ID = os.environ.get(
     "CLAUDE_LOGIN_OAUTH_CLIENT_ID", "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -256,6 +257,24 @@ def fetch_one(profile) -> Optional[Usage]:
     if status != 200 or not isinstance(payload, dict):
         return None
     return parse(payload, fetched_at=ui.now_ms())
+
+
+def fetch_org_uuid(profile) -> Optional[str]:
+    """The account's organisation uuid, which names the app's chat directory.
+
+    Lives here rather than in ``claude_app`` because it needs this module's
+    transport and its refresh-on-expiry handling; the app itself reads the very
+    same endpoint to decide where to keep its sessions.
+    """
+    token = _token_for(profile)
+    if not token:
+        return None
+    status, payload = _request(PROFILE_PATH, token=token)
+    if status != 200 or not isinstance(payload, dict):
+        return None
+    organization = payload.get("organization")
+    uuid = organization.get("uuid") if isinstance(organization, dict) else None
+    return uuid if isinstance(uuid, str) and uuid else None
 
 
 def fetch_all(profiles: Iterable[Any]) -> dict[str, Optional[Usage]]:
