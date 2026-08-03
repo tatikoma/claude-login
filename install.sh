@@ -32,6 +32,9 @@ command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
 
 mkdir -p "$BIN_DIR"
 chmod +x "$REPO/bin/claude-login"
+# A zip download loses the executable bit, and a .command that is not executable
+# fails silently on double-click — restore it every time.
+chmod +x "$REPO"/scripts/*.command 2>/dev/null || true
 ln -sf "$REPO/bin/claude-login" "$BIN_DIR/claude-login"
 ln -sf "$REPO/bin/claude-login" "$BIN_DIR/ccl"
 
