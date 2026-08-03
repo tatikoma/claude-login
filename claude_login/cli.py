@@ -28,8 +28,15 @@ _ALIASES = {
 #: not mistaken for the account name. All are boolean today.
 _VALUE_FLAGS: set[str] = set()
 
+#: Target flags are recognised even *after* the account name, unlike every other
+#: trailing argument. ``claude`` has no flags by these names, so forwarding them
+#: would only make it abort — and `claude-login work --app` is the order people
+#: actually type. The escape hatch stays: `claude-login work -- --app`.
+_TARGET_FLAGS = {"--app", "--cli"}
+
 _COMMANDS = {
     "add",
+    "app",
     "list",
     "use",
     "rename",
@@ -39,7 +46,9 @@ _COMMANDS = {
     "flags",
     "settings",
     "relink",
+    "setup",
     "sync",
+    "sync-all",
     "doctor",
 }
 
@@ -153,6 +162,50 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_settings.set_defaults(func=commands.cmd_settings)
 
+    p_app = sub.add_parser("app", help="manage the Claude desktop app profiles")
+    app_sub = p_app.add_subparsers(dest="app_command", metavar="<action>")
+    p_app.set_defaults(func=commands.cmd_app_status)
+
+    p_app_status = app_sub.add_parser("status", help="app login state per account")
+    p_app_status.set_defaults(func=commands.cmd_app_status)
+
+    p_app_adopt = app_sub.add_parser(
+        "adopt", help="fold existing app chats into the shared pool"
+    )
+    p_app_adopt.add_argument(
+        "--dry-run", "-n", action="store_true", help="only show what would move"
+    )
+    p_app_adopt.add_argument(
+        "--yes", "-y", action="store_true", help="do not ask for confirmation"
+    )
+    p_app_adopt.set_defaults(func=commands.cmd_app_adopt)
+
+    p_app_open = app_sub.add_parser(
+        "open", help="open the app under several accounts at once"
+    )
+    p_app_open.add_argument(
+        "names", nargs="*", help="default: the accounts chosen in settings"
+    )
+    p_app_open.set_defaults(func=commands.cmd_app_open)
+
+    p_app_link = app_sub.add_parser(
+        "link", help="link accounts into the chat pool without launching the app"
+    )
+    p_app_link.add_argument("name", nargs="?", help="default: every account")
+    p_app_link.set_defaults(func=commands.cmd_app_link)
+
+    p_app_relink = app_sub.add_parser(
+        "relink", help="recreate the app's shared links and pool links"
+    )
+    p_app_relink.add_argument("name", nargs="?", help="default: every account")
+    p_app_relink.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="move diverged private copies into <profile>/app-data/.shadowed/",
+    )
+    p_app_relink.set_defaults(func=commands.cmd_app_relink)
+
     p_env = sub.add_parser("env", help="print the shell export for an account")
     p_env.add_argument("name")
     p_env.set_defaults(func=commands.cmd_env)
@@ -171,7 +224,23 @@ def build_parser() -> argparse.ArgumentParser:
         "sync", help="re-copy trusted folders / MCP servers from ~/.claude.json"
     )
     p_sync.add_argument("name", nargs="?", help="default: every account")
+    p_sync.add_argument(
+        "--gather",
+        action="store_true",
+        help="first collect MCP servers the profiles have and ~/.claude.json lacks",
+    )
     p_sync.set_defaults(func=commands.cmd_sync)
+
+    p_sync_all = sub.add_parser(
+        "sync-all", help="share skills, MCP servers and chats across every account"
+    )
+    p_sync_all.add_argument(
+        "--dry-run", "-n", action="store_true", help="only show what would change"
+    )
+    p_sync_all.set_defaults(func=commands.cmd_sync_all)
+
+    p_setup = sub.add_parser("setup", help="walk a new machine through first-time setup")
+    p_setup.set_defaults(func=commands.cmd_setup)
 
     p_doctor = sub.add_parser("doctor", help="diagnose the setup")
     p_doctor.set_defaults(func=commands.cmd_doctor)
@@ -199,6 +268,30 @@ def _add_launch_flags(parser: argparse.ArgumentParser) -> None:
         default=argparse.SUPPRESS,
         help="ignore the configured launch flags and start claude bare",
     )
+    parser.add_argument(
+        "--app",
+        dest="app",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="launch the Claude desktop app instead of the CLI",
+    )
+    parser.add_argument(
+        "--cli",
+        dest="cli",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="launch the CLI even when the configured target is the app",
+    )
+
+
+def hoist_target_flags(argv: list[str]) -> list[str]:
+    """Move ``--app``/``--cli`` to the front, stopping at an explicit ``--``."""
+    stop = argv.index("--") if "--" in argv else len(argv)
+    hoisted = [token for token in argv[:stop] if token in _TARGET_FLAGS]
+    if not hoisted:
+        return argv
+    kept = [token for token in argv[:stop] if token not in _TARGET_FLAGS]
+    return hoisted + kept + argv[stop:]
 
 
 def split_args(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -208,6 +301,7 @@ def split_args(argv: list[str]) -> tuple[list[str], list[str]]:
     ``claude-login -- --resume`` forwards ``--resume`` to whichever account the
     picker ends up selecting.
     """
+    argv = hoist_target_flags(argv)
     index = 0
     while index < len(argv):
         token = argv[index]

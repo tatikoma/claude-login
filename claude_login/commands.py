@@ -7,12 +7,13 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from . import claude_cli, keychain, picker, store, ui, usage
-from .errors import ClaudeLoginError, UsageError
+from . import claude_app, claude_cli, keychain, picker, store, ui, usage
+from .errors import ClaudeAppError, ClaudeLoginError, UsageError
 from .store import Profile, Status, Vault
 
 #: Short forms normalised before de-duplicating flags across layers.
@@ -183,6 +184,204 @@ def build_claude_args(
 
 def launch_args_for(vault: Vault, args) -> list[str]:
     return [] if getattr(args, "no_flags", False) else vault.launch_args
+
+
+# --- launch targets --------------------------------------------------------
+
+
+def resolve_target(vault: Vault, args) -> str:
+    """Whether this launch goes to the CLI or to the desktop app.
+
+    An explicit flag beats the configured default; ``ask`` only asks when there
+    is a terminal to ask in, and otherwise behaves like ``cli`` so scripts and
+    pipes keep working.
+    """
+    if getattr(args, "app", False):
+        return "app"
+    if getattr(args, "cli", False):
+        return "cli"
+    target = vault.launch_target
+    if target != "ask":
+        return target
+    if not ui.is_interactive():
+        return "cli"
+    return "app" if ui.confirm("Launch the Claude app instead of the CLI?") else "cli"
+
+
+def base_target(vault: Vault, args) -> str:
+    """The target Enter would pick, without stopping to ask.
+
+    ``o`` in the list flips this rather than the answer to a prompt: flipping a
+    question you were just asked would be a confusing thing to offer.
+    """
+    if getattr(args, "app", False):
+        return "app"
+    if getattr(args, "cli", False):
+        return "cli"
+    target = vault.launch_target
+    return target if target != "ask" else "cli"
+
+
+def other_target(target: str) -> str:
+    return "cli" if target == "app" else "app"
+
+
+def dispatch(vault: Vault, profile: Profile, args, target: str) -> int:
+    """Hand the profile over to whichever target was chosen."""
+    if target == "app":
+        launch_app(vault, profile, args)
+        return 0
+    passthrough = list(getattr(args, "claude_args", None) or [])
+    launch(vault, profile, passthrough, launch_args_for(vault, args))
+    return 0  # unreachable for the CLI: exec replaced us
+
+
+def pool_guard(data_dir: str) -> tuple[bool, Optional[str]]:
+    """``(safe_to_wire, account_being_written_to)`` for one data directory.
+
+    A live window only ever writes to the chat directory of the account it is
+    signed in as, so that one is folded in carefully and the rest move outright.
+    When the directory is open but the signed-in account cannot be read, nothing
+    is touched: guessing is the one mistake here with real data behind it.
+    """
+    if not claude_app.is_in_use(data_dir):
+        return True, None
+    account = claude_app.app_status(data_dir).account_uuid
+    return (True, account) if account else (False, None)
+
+
+def pending_pool_labels(vault: Vault) -> list[str]:
+    """Data directories whose chats are still private, worth nagging about.
+
+    This is the case that reads as "sharing does not work": the pool is wired but
+    the chats from before it existed never moved, so the shared list is empty.
+    """
+    if not vault.sharing_enabled:
+        return []
+    pending = []
+    for label, data_dir in app_data_dirs(vault):
+        if any(
+            not leaf.is_symlink() for leaf in claude_app.session_leaf_dirs(data_dir)
+        ):
+            pending.append(label)
+    return pending
+
+
+def resolve_org_uuid(vault: Vault, profile: Profile) -> Optional[str]:
+    """The organisation uuid that, with the account uuid, names the chat dir.
+
+    Cached in the registry once found.  Disk first — every app data directory is
+    scanned for a directory this account already owns, which costs nothing and
+    works offline — and only then the API, the same endpoint the app itself uses.
+    """
+    if profile.org_uuid:
+        return profile.org_uuid
+    if not profile.account_uuid:
+        return None
+    for _, data_dir in app_data_dirs(vault):
+        known = vault.known_org_uuids(data_dir, profile.account_uuid)
+        if known:
+            return _remember_org_uuid(vault, profile, known[0])
+    fetched = usage.fetch_org_uuid(profile)
+    return _remember_org_uuid(vault, profile, fetched) if fetched else None
+
+
+def _remember_org_uuid(vault: Vault, profile: Profile, org_uuid: str) -> str:
+    profile.org_uuid = org_uuid
+    with vault.locked():
+        stored = vault.find(profile.name)
+        if stored:
+            stored.org_uuid = org_uuid
+            vault.upsert(stored)
+            vault.save()
+    return org_uuid
+
+
+def prepare_app_profile(vault: Vault, profile: Profile) -> tuple[str, store.PoolPlan]:
+    """Give the profile its data directory, its shared links and its chat pool.
+
+    Wiring the pool moves files, so it is skipped while the app is up: losing a
+    launch to a migration would be the wrong trade for something done daily.
+    Creating the link ahead of the app is safe either way, and it is what makes a
+    brand-new profile show the shared chats the moment it signs in.
+    """
+    data_dir = vault.app_data_dir_for(profile)
+    Path(data_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+    plan = store.PoolPlan()
+    # Resolving the org uuid may write to the registry, so it happens before the
+    # lock below — flock is not reentrant, and nesting would deadlock.
+    org_uuid = resolve_org_uuid(vault, profile) if vault.shares_chats(profile) else None
+    with vault.locked():
+        linked, conflicts = vault.link_app_shared(profile)
+        if vault.app_per_account and not profile.is_default and not profile.app_data_dir:
+            fresh = vault.get(profile.name)
+            fresh.app_data_dir = data_dir
+            vault.upsert(fresh)
+        if vault.shares_chats(profile):
+            safe, live = pool_guard(data_dir)
+            if safe:
+                plan = vault.wire_session_pool(
+                    data_dir, live_account=live, sharing=vault.sharing_account_uuids()
+                )
+            if org_uuid and profile.account_uuid:
+                plan.prelinked = vault.link_session_pool(
+                    data_dir, profile.account_uuid, org_uuid
+                )
+        vault.touch(profile.name)
+        vault.save()
+    if linked:
+        ui.note(f"  shared with the app: {', '.join(linked)}")
+    if conflicts:
+        ui.warn(f"not shared (a local copy is in the way): {', '.join(conflicts)}")
+    return data_dir, plan
+
+
+def launch_app(vault: Vault, profile: Profile, args) -> int:
+    """Start the desktop app under this account and return its pid."""
+    claude_app.find_app()
+    data_dir, plan = prepare_app_profile(vault, profile)
+    status = claude_app.app_status(data_dir)
+
+    ui.step(f"{ui.paint(profile.display, 'bold')}  {ui.paint(describe(profile), 'grey')}")
+    ui.note(f"  CLAUDE_USER_DATA_DIR={data_dir}")
+    if plan.linked:
+        ui.note(f"  chats pooled: {plan.moved} moved from {plan.linked} directory(ies)")
+    if plan.collisions:
+        ui.note(f"  {plan.collisions} name clash(es) resolved by keeping the newer chat")
+    if plan.prelinked:
+        ui.note("  chat pool linked ahead of the app — shared chats show up on sign-in")
+    if vault.shares_chats(profile) and claude_app.is_in_use(data_dir):
+        ui.note(
+            "  this profile is already open — quit that window and run"
+            " `claude-login app adopt` to pool the rest of its chats"
+        )
+    pending = pending_pool_labels(vault)
+    if pending:
+        ui.warn(
+            f"chats still outside the pool: {', '.join(pending)} — quit every Claude "
+            "window and run `claude-login app adopt` once to share them"
+        )
+    if not status.signed_in:
+        ui.note("  the app asks for a sign-in once; that login is separate from the CLI's")
+    elif (
+        status.account_uuid
+        and profile.account_uuid
+        and status.account_uuid != profile.account_uuid
+    ):
+        ui.warn(
+            f"this app profile is signed in as {status.account_uuid}, "
+            f"not {profile.account_uuid}"
+        )
+    else:
+        last = claude_app.last_session(
+            vault.pool_dir(claude_app.SESSIONS_DIRNAME), cwd=os.getcwd()
+        )
+        if last and last.get("title"):
+            ui.note(f"  last chat here: {last['title']}")
+
+    pid = claude_app.launch(data_dir, vault.app_env)
+    ui.success(f"launched the Claude app (pid {pid})")
+    return pid
 
 
 # --- launch-flag editing ---------------------------------------------------
@@ -419,7 +618,7 @@ def cmd_add(vault: Vault, args) -> int:
         and not args.no_use
         and ui.confirm("Launch claude as this account now?", default=False)
     ):
-        launch(vault, profile, [], launch_args_for(vault, args))
+        dispatch(vault, profile, args, base_target(vault, args))
     return 0
 
 
@@ -450,12 +649,17 @@ def _discard_staging(staging: Path) -> None:
 def cmd_use(vault: Vault, args) -> int:
     bootstrap(vault)
     profile = vault.resolve(args.name)
-    status = vault.status(profile)
-    if not status.usable and not _offer_login(vault, profile, status, assume_yes=args.yes):
-        return 1
+    target = resolve_target(vault, args)
+    # The app signs in on its own, so the CLI's credential state is not a
+    # precondition for handing an account over to it.
+    if target == "cli":
+        status = vault.status(profile)
+        if not status.usable and not _offer_login(
+            vault, profile, status, assume_yes=args.yes
+        ):
+            return 1
     profile = vault.reload().get(profile.name)
-    launch(vault, profile, list(args.claude_args or []), launch_args_for(vault, args))
-    return 0
+    return dispatch(vault, profile, args, target)
 
 
 def cmd_rename(vault: Vault, args) -> int:
@@ -598,14 +802,14 @@ def cmd_flags(vault: Vault, args) -> int:
 
 
 #: (kind, flag) per settings row, in display order.
-_SETTINGS_ROWS = (
+_FLAGS_ROWS = (
     *(("toggle", name) for name, _ in TOGGLE_SETTINGS),
     ("effort", "--effort"),
     ("other", None),
 )
 
 
-def _settings_title(vault: Vault) -> str:
+def _flags_title(vault: Vault) -> str:
     flags = vault.reload().launch_args
     preview = f"claude {' '.join(flags)}".rstrip()
     return "\n".join(
@@ -617,7 +821,7 @@ def _settings_title(vault: Vault) -> str:
     )
 
 
-def _settings_items(vault: Vault) -> list[picker.Item]:
+def _flags_items(vault: Vault) -> list[picker.Item]:
     flags = vault.reload().launch_args
     items = []
     for name, label in TOGGLE_SETTINGS:
@@ -660,7 +864,7 @@ def _save_launch_args(vault: Vault, flags: list[str]) -> None:
         vault.save()
 
 
-def cmd_settings(vault: Vault, args=None) -> int:
+def cmd_settings_flags(vault: Vault, args=None) -> int:
     """Interactive editor for the flags every launch passes to ``claude``."""
     bootstrap(vault)
     actions = [picker.Action("e", "edit as text"), picker.Action("c", "clear all")]
@@ -668,7 +872,7 @@ def cmd_settings(vault: Vault, args=None) -> int:
 
     def on_select(index: int) -> bool:
         """Toggle in place; the text row defers so the caller can prompt."""
-        kind, name = _SETTINGS_ROWS[index]
+        kind, name = _FLAGS_ROWS[index]
         if kind == "other":
             return False
         flags = vault.reload().launch_args
@@ -683,8 +887,8 @@ def cmd_settings(vault: Vault, args=None) -> int:
 
     while True:
         result = picker.pick(
-            lambda: _settings_items(vault),
-            title=lambda: _settings_title(vault),
+            lambda: _flags_items(vault),
+            title=lambda: _flags_title(vault),
             actions=actions,
             headers=("SETTING", "FLAG", "VALUE"),
             initial=selected,
@@ -708,6 +912,615 @@ def cmd_settings(vault: Vault, args=None) -> int:
                 _save_launch_args(vault, answer.split())
         elif result.action == "c":
             _save_launch_args(vault, [])
+
+
+# --- settings: sections ----------------------------------------------------
+
+#: The sections of the top-level settings screen, in display order.
+SETTINGS_SECTIONS = ("target", "flags", "app")
+
+
+def cycle_target(current: str) -> str:
+    order = store.LAUNCH_TARGETS
+    index = order.index(current) if current in order else -1
+    return order[(index + 1) % len(order)]
+
+
+def target_label(target: str) -> str:
+    return {"cli": "CLI", "app": "Claude Code App", "ask": "ask every time"}.get(
+        target, target
+    )
+
+
+def _settings_sections(vault: Vault) -> list[picker.Item]:
+    vault.reload()
+    flags = vault.launch_args
+    app_bits = [
+        "per-account" if vault.app_per_account else "one shared profile",
+        f"{_chosen_count(vault, vault.app_shared_accounts)} sharing chats",
+        f"{len(vault.app_shared)} shared entries",
+    ]
+    return [
+        picker.Item(
+            cells=["Launch target", ui.paint(target_label(vault.launch_target), "green")]
+        ),
+        picker.Item(
+            cells=[
+                "Launch flags (CLI)",
+                ui.paint(" ".join(flags), "cyan") if flags else ui.paint("none", "grey"),
+            ]
+        ),
+        picker.Item(cells=["Claude Code App", ui.paint(" · ".join(app_bits), "grey")]),
+    ]
+
+
+def cmd_settings(vault: Vault, args=None) -> int:
+    """Top-level settings: launch target, CLI flags, the app profile."""
+    bootstrap(vault)
+    selected = 0
+
+    def on_select(index: int) -> bool:
+        """The target row cycles in place; the other two open a screen."""
+        if SETTINGS_SECTIONS[index] != "target":
+            return False
+        with vault.locked():
+            vault.set_launch_target(cycle_target(vault.launch_target))
+            vault.save()
+        return True
+
+    while True:
+        result = picker.pick(
+            lambda: _settings_sections(vault),
+            title=lambda: ui.paint("Settings", "bold"),
+            headers=("SETTING", "VALUE"),
+            initial=selected,
+            enter_label="open",
+            quit_label="back",
+            on_select=on_select,
+        )
+        if result.action == picker.CANCEL:
+            return 0
+        if result.index is not None:
+            selected = result.index
+        if result.action != "select":
+            continue
+        if SETTINGS_SECTIONS[selected] == "flags":
+            cmd_settings_flags(vault)
+        elif SETTINGS_SECTIONS[selected] == "app":
+            cmd_settings_app(vault)
+
+
+#: (kind, label) per app-settings row, in display order.
+_APP_SETTINGS_ROWS = (
+    ("per-account", "Per-account app profile"),
+    ("open", "Accounts to open"),
+    ("sharing", "Accounts sharing chats"),
+    ("shared", "Shared entries"),
+    ("env", "Launch env"),
+    ("path", "App path"),
+)
+
+
+def _chosen_count(vault: Vault, selected: Optional[list[str]]) -> str:
+    """``2 of 3`` — how many accounts a list covers. Absent means all of them."""
+    total = len(vault.profiles)
+    chosen = total if selected is None else len([n for n in selected if vault.find(n)])
+    return f"{chosen} of {total}"
+
+
+def _app_settings_items(vault: Vault) -> list[picker.Item]:
+    vault.reload()
+    on, off = ui.paint("on", "green"), ui.paint("off", "grey")
+    values = {
+        "per-account": on if vault.app_per_account else off,
+        "open": ui.paint(_chosen_count(vault, vault.app_open_accounts), "grey"),
+        "sharing": ui.paint(_chosen_count(vault, vault.app_shared_accounts), "grey"),
+        "shared": ui.paint(f"{len(vault.app_shared)} entries", "grey"),
+        "env": ui.paint(f"{len(vault.app_env)} variable(s)", "grey"),
+        "path": ui.paint(claude_app.app_bundle(), "grey"),
+    }
+    hints = {
+        kind: ui.paint("edit", "grey") for kind in ("open", "sharing", "shared", "env")
+    }
+    return [
+        picker.Item(cells=[label, values[kind], hints.get(kind, "")])
+        for kind, label in _APP_SETTINGS_ROWS
+    ]
+
+
+def _app_settings_title() -> str:
+    return "\n".join(
+        [
+            ui.paint("Settings — Claude Code App", "bold"),
+            "",
+            ui.paint(
+                "Each account gets its own app profile, so both stay signed in and "
+                "can be open at once; chats stay shared between them.",
+                "grey",
+            ),
+        ]
+    )
+
+
+def cmd_settings_app(vault: Vault, args=None) -> int:
+    """How the desktop app is launched, and what its profiles share."""
+    bootstrap(vault)
+    selected = 0
+
+    def on_select(index: int) -> bool:
+        """Only the boolean row toggles here; the lists open their own screen."""
+        if _APP_SETTINGS_ROWS[index][0] != "per-account":
+            return False
+        with vault.locked():
+            vault.set_app_per_account(not vault.app_per_account)
+            vault.save()
+        return True
+
+    while True:
+        result = picker.pick(
+            lambda: _app_settings_items(vault),
+            title=_app_settings_title,
+            headers=("SETTING", "VALUE", ""),
+            initial=selected,
+            enter_label="change",
+            quit_label="back",
+            on_select=on_select,
+        )
+        if result.action == picker.CANCEL:
+            return 0
+        if result.index is not None:
+            selected = result.index
+        if result.action != "select":
+            continue
+        kind = _APP_SETTINGS_ROWS[selected][0]
+        if kind == "open":
+            cmd_settings_accounts(vault, "open")
+        elif kind == "sharing":
+            cmd_settings_accounts(vault, "sharing")
+        elif kind == "shared":
+            cmd_settings_shared(vault)
+        elif kind == "env":
+            current = " ".join(f"{k}={v}" for k, v in vault.app_env.items())
+            answer = ui.ask("Launch env (KEY=VALUE ...):", default=current)
+            if answer is not None:
+                with vault.locked():
+                    vault.set_app_env(parse_env(answer))
+                    vault.save()
+        elif kind == "path":
+            ui.note("  point CLAUDE_LOGIN_APP_PATH at another bundle to change this")
+
+
+def shared_entry_choices(vault: Vault) -> list[str]:
+    """Everything worth offering: the built-in list plus whatever is configured.
+
+    Order is stable so the rows do not jump around between redraws.
+    """
+    choices = list(claude_app.DEFAULT_APP_SHARED)
+    for entry in vault.app_shared:
+        if entry not in choices:
+            choices.append(entry)
+    return choices
+
+
+def _shared_items(vault: Vault) -> list[picker.Item]:
+    vault.reload()
+    chosen = set(vault.app_shared)
+    machine = Path(claude_app.default_app_support_dir())
+    items = []
+    for entry in shared_entry_choices(vault):
+        ticked = entry in chosen
+        present = (machine / entry).exists()
+        items.append(
+            picker.Item(
+                cells=[
+                    ui.paint("[x]", "green") if ticked else ui.paint("[ ]", "grey"),
+                    entry,
+                    ui.paint("" if present else "not on this machine", "grey"),
+                ],
+                value=entry,
+            )
+        )
+    return items
+
+
+def cmd_settings_shared(vault: Vault, args=None) -> int:
+    """Tick which app entries are shared between profiles.
+
+    A checkbox list rather than an editable line: two of the names contain
+    spaces (``Claude Extensions``), and a space-separated round trip silently
+    shredded them into fragments that match nothing — which looked exactly like
+    "sharing does not work" while everything reported success.
+    """
+    bootstrap(vault)
+    choices = shared_entry_choices(vault)
+
+    def on_select(index: int) -> bool:
+        if index >= len(choices):
+            return True
+        with vault.locked():
+            vault.set_app_shared(toggled(vault.app_shared, choices[index]))
+            vault.save()
+        return True
+
+    picker.pick(
+        lambda: _shared_items(vault),
+        title="\n".join(
+            [
+                ui.paint("Settings — shared with the app", "bold"),
+                "",
+                ui.paint(
+                    "Ticked entries are symlinked from the machine-wide app "
+                    "directory into every profile. config.json is never here — "
+                    "it holds the account's token.",
+                    "grey",
+                ),
+            ]
+        ),
+        headers=("", "ENTRY", ""),
+        enter_label="toggle",
+        quit_label="back",
+        on_select=on_select,
+    )
+    return 0
+
+
+#: (title, hint) per account-list screen.
+_ACCOUNT_SCREENS = {
+    "open": (
+        "Settings — accounts to open",
+        "`claude-login app open` and the open-accounts script start these.",
+    ),
+    "sharing": (
+        "Settings — accounts sharing chats",
+        "Ticked accounts see one shared list of Code chats. Unticking gives an "
+        "account its own copy back — nothing is lost either way.",
+    ),
+}
+
+
+def selected_accounts(vault: Vault, kind: str) -> Optional[list[str]]:
+    return vault.app_open_accounts if kind == "open" else vault.app_shared_accounts
+
+
+def _account_items(vault: Vault, kind: str) -> list[picker.Item]:
+    vault.reload()
+    selected = selected_accounts(vault, kind)
+    items = []
+    for profile in vault.profiles:
+        ticked = selected is None or profile.name in selected
+        items.append(
+            picker.Item(
+                cells=[
+                    ui.paint("[x]", "green") if ticked else ui.paint("[ ]", "grey"),
+                    profile.display,
+                    ui.paint(describe(profile), "grey"),
+                ],
+                value=profile,
+            )
+        )
+    return items
+
+
+def toggled(names: list[str], name: str) -> list[str]:
+    return [n for n in names if n != name] if name in names else [*names, name]
+
+
+def cmd_settings_accounts(vault: Vault, kind: str, args=None) -> int:
+    """Tick which accounts a list covers, one screen for both lists.
+
+    An absent list means "all accounts"; the first toggle turns it into an
+    explicit one, which is why the current names are materialised on entry.
+    """
+    bootstrap(vault)
+    title, hint = _ACCOUNT_SCREENS[kind]
+
+    def on_select(index: int) -> bool:
+        vault.reload()
+        profiles = vault.profiles
+        if index >= len(profiles):
+            return True
+        selected = selected_accounts(vault, kind)
+        names = [p.name for p in profiles] if selected is None else list(selected)
+        target = profiles[index].name
+        names = toggled(names, target)
+        with vault.locked():
+            if kind == "open":
+                vault.set_app_open_accounts(names)
+            else:
+                vault.set_app_shared_accounts(names)
+                if target not in names:
+                    # Unticking has to be reversible, so hand the account back
+                    # its own copy rather than leave a link into a pool it is no
+                    # longer part of.
+                    profile = vault.find(target)
+                    if profile:
+                        data_dir = vault.app_data_dir_for(profile)
+                        if not claude_app.is_in_use(data_dir):
+                            vault.unwire_session_pool(data_dir)
+            vault.save()
+        return True
+
+    picker.pick(
+        lambda: _account_items(vault, kind),
+        title="\n".join([ui.paint(title, "bold"), "", ui.paint(hint, "grey")]),
+        headers=("", "ACCOUNT", ""),
+        enter_label="toggle",
+        quit_label="back",
+        on_select=on_select,
+    )
+    return 0
+
+
+def parse_env(text: str) -> dict[str, str]:
+    """``FOO=bar BAZ=qux`` → dict. Tokens without an ``=`` are ignored."""
+    env: dict[str, str] = {}
+    for token in text.split():
+        key, separator, value = token.partition("=")
+        if separator and key:
+            env[key] = value
+    return env
+
+
+# --- the app's own subcommands ---------------------------------------------
+
+APP_STATUS_HEADERS = ("ACCOUNT", "APP LOGIN", "CHATS", "DATA DIR")
+
+
+def app_data_dirs(vault: Vault) -> list[tuple[str, str]]:
+    """Every app data directory worth touching, as ``(label, path)``.
+
+    The machine-wide one is always first and never conditional on ``~/.claude``
+    having a login of its own: it holds the chats from before any of this
+    existed, which are exactly the ones worth pooling.  Duplicates collapse, so
+    this stays right when several profiles map to the same directory.
+    """
+    entries = [("machine-wide", claude_app.default_app_support_dir())]
+    entries += [(p.display, vault.app_data_dir_for(p)) for p in vault.profiles]
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for label, path in entries:
+        key = os.path.normpath(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((label, path))
+    return unique
+
+
+def _chats_state(vault: Vault, data_dir: str) -> str:
+    """How this profile's chat directories relate to the shared pool."""
+    leaves = claude_app.session_leaf_dirs(data_dir)
+    if not leaves:
+        return ui.paint("none yet", "grey")
+    if all(leaf.is_symlink() for leaf in leaves):
+        return ui.paint("shared", "green")
+    if any(leaf.is_symlink() for leaf in leaves):
+        return ui.paint("partly shared", "yellow")
+    return ui.paint("private", "yellow")
+
+
+def cmd_app_status(vault: Vault, args=None) -> int:
+    """Per account: whether the app is signed in, and where its data lives."""
+    bootstrap(vault)
+    if not claude_app.available():
+        ui.warn(f"the Claude app was not found at {claude_app.app_bundle()}")
+    badges = {
+        "signed-in": ui.paint("signed in", "green"),
+        "logged-out": ui.paint("not signed in", "yellow"),
+        "missing": ui.paint("no profile yet", "grey"),
+    }
+    rows = []
+    for profile in vault.profiles:
+        data_dir = vault.app_data_dir_for(profile)
+        status = claude_app.app_status(data_dir)
+        rows.append(
+            [
+                profile.display,
+                badges.get(status.state, status.state),
+                _chats_state(vault, data_dir),
+                ui.paint(data_dir, "grey"),
+            ]
+        )
+    if not rows:
+        ui.info("No accounts yet. Add one with `claude-login add`.")
+        return 0
+    print(ui.render_table(list(APP_STATUS_HEADERS), rows))
+    return 0
+
+
+def cmd_app_adopt(vault: Vault, args) -> int:
+    """Fold every account's existing app chats into the one shared pool.
+
+    A directory that a live window has open is left alone rather than blocking
+    the whole run: pooling one account's chats while another account's window
+    stays open is both safe and useful.
+    """
+    bootstrap(vault)
+    dry_run = getattr(args, "dry_run", False)
+    total = store.PoolPlan()
+    busy: list[str] = []
+    for label, data_dir in app_data_dirs(vault):
+        if not Path(data_dir).is_dir():
+            continue
+        safe, live_account = pool_guard(data_dir)
+        if not safe:
+            busy.append(label)
+            continue
+        with vault.locked():
+            plan = vault.wire_session_pool(
+                data_dir, dry_run=dry_run, live_account=live_account
+            )
+            vault.save()
+        total.moved += plan.moved
+        total.linked += plan.linked
+        total.collisions += plan.collisions
+        total.live += plan.live
+        total.unmoved.extend(plan.unmoved)
+        total.backup = total.backup or plan.backup
+        if plan.linked:
+            ui.info(f"{label}: {plan.moved} chat(s) from {plan.linked} directory(ies)")
+
+    with vault.locked():
+        total.orphans = vault.sweep_pool(dry_run=dry_run)
+        vault.save()
+
+    if busy:
+        ui.warn(
+            f"left untouched, cannot tell who is signed in: {', '.join(sorted(set(busy)))}"
+            " — quit that window and run this again"
+        )
+    if total.live:
+        ui.note(
+            f"  {total.live} directory(ies) were open in the app and folded in by copy;"
+            " the originals are kept next to them as .replaced-<ms>"
+        )
+    if total.backup:
+        ui.note(f"  backup: {total.backup}")
+    if total.collisions:
+        ui.note(f"  {total.collisions} name clash(es); the newer chat was kept")
+    if total.unmoved:
+        ui.warn(
+            "left alone because it is not a chat file: "
+            f"{', '.join(total.unmoved[:6])} — that directory keeps its own chats"
+        )
+    if total.orphans:
+        ui.note(
+            f"  {total.orphans} chat(s) had no transcript left on disk and were set "
+            "aside in app-shared/orphans (the app could only say 'session not found')"
+        )
+    if dry_run:
+        ui.note("  (dry run — nothing was touched)")
+        return 0
+    if not total.linked and not total.orphans:
+        if busy:
+            ui.note("  nothing else to move")
+            return 1
+        ui.success("nothing to adopt — chats are already shared")
+        return 0
+    ui.success(
+        f"pooled {total.moved} chat(s) — every account now shows the same Recents"
+    )
+    return 0
+
+
+#: Electron instances started in the same instant fight over CPU and over first
+#: access to the shared sidecar binaries, so they are staggered.
+LAUNCH_STAGGER_SECONDS = 1.5
+
+
+def cmd_app_open(vault: Vault, args) -> int:
+    """Open the app under several accounts at once."""
+    bootstrap(vault)
+    claude_app.find_app()
+    names = list(getattr(args, "names", None) or []) or vault.app_open_accounts
+    if names is None:
+        targets = vault.profiles
+    else:
+        targets = []
+        for name in names:
+            try:
+                targets.append(vault.resolve(name))
+            except ClaudeLoginError:
+                # A stale name in the configured list must not stop the rest.
+                ui.warn(f"no account named {name!r} — skipping")
+
+    opened = 0
+    for profile in targets:
+        data_dir = vault.app_data_dir_for(profile)
+        if claude_app.is_in_use(data_dir):
+            ui.note(f"  {profile.display}: already open")
+            continue
+        if opened:
+            time.sleep(LAUNCH_STAGGER_SECONDS)
+        launch_app(vault, vault.reload().get(profile.name), args)
+        opened += 1
+    if not opened:
+        ui.success("nothing to open — every account already has a window")
+    return 0
+
+
+def cmd_app_link(vault: Vault, args) -> int:
+    """Link accounts into the chat pool without waiting for the app to run.
+
+    Useful right after adding an account: the pool link normally appears on the
+    first launch, and this makes it appear now.
+    """
+    bootstrap(vault)
+    if not vault.sharing_enabled:
+        ui.note("  chat sharing is off — turn it on in `claude-login settings`")
+        return 0
+    named = getattr(args, "name", None)
+    targets = [vault.resolve(named)] if named else vault.profiles
+    linked = 0
+    for profile in targets:
+        data_dir = vault.app_data_dir_for(profile)
+        org_uuid = resolve_org_uuid(vault, profile)
+        if not org_uuid or not profile.account_uuid:
+            ui.warn(
+                f"{profile.display}: no organisation uuid yet — it is learnt on the "
+                "first app launch or from the API when online"
+            )
+            continue
+        Path(data_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
+        with vault.locked():
+            count = vault.link_session_pool(data_dir, profile.account_uuid, org_uuid)
+            vault.save()
+        linked += count
+        ui.info(
+            f"{profile.display}: {'linked' if count else 'already linked'}"
+            f"  ({profile.account_uuid}/{org_uuid})"
+        )
+    if linked:
+        ui.success(f"created {linked} pool link(s)")
+    return 0
+
+
+def cmd_app_relink(vault: Vault, args) -> int:
+    """Recreate the app's shared symlinks and its links into the pool."""
+    bootstrap(vault)
+    named = getattr(args, "name", None)
+    targets = [vault.resolve(named)] if named else vault.profiles
+    pooling = vault.sharing_enabled
+    stuck = False
+    for profile in targets:
+        data_dir = vault.app_data_dir_for(profile)
+        org_uuid = resolve_org_uuid(vault, profile) if pooling else None
+        with vault.locked():
+            linked, conflicts = vault.link_app_shared(
+                profile, repair=getattr(args, "force", False)
+            )
+            if pooling and Path(data_dir).is_dir():
+                safe, live = pool_guard(data_dir)
+                if safe:
+                    vault.wire_session_pool(data_dir, live_account=live)
+                if org_uuid and profile.account_uuid:
+                    vault.link_session_pool(data_dir, profile.account_uuid, org_uuid)
+            vault.save()
+        ui.info(
+            f"{profile.display}: {', '.join(linked) if linked else 'already up to date'}"
+        )
+        if linked and getattr(args, "force", False):
+            ui.note(f"  any private copy of those went to {data_dir}/.shadowed/")
+        if conflicts:
+            stuck = True
+            ui.warn(f"  {profile.display} has its own copy of: {', '.join(conflicts)}")
+    if pooling and not named:
+        # The machine-wide directory has no shared links of its own — it is the
+        # source — but its chats still belong in the pool.
+        machine = claude_app.default_app_support_dir()
+        safe, machine_live = pool_guard(machine)
+        if Path(machine).is_dir() and safe:
+            with vault.locked():
+                vault.wire_session_pool(machine, live_account=machine_live)
+                vault.save()
+    if stuck:
+        ui.note(
+            "  `claude-login app relink --force` moves those copies into"
+            " <profile>/app-data/.shadowed/"
+        )
+    # A left-over private copy means the entry is not actually shared, so this
+    # cannot report success — `sync-all` counts on the return value.
+    return 1 if stuck else 0
 
 
 def cmd_env(vault: Vault, args) -> int:
@@ -745,6 +1558,12 @@ def cmd_relink(vault: Vault, args) -> int:
 def cmd_sync(vault: Vault, args) -> int:
     """Re-copy the shared half of ~/.claude.json into the profiles."""
     bootstrap(vault)
+    if getattr(args, "gather", False):
+        with vault.locked():
+            added = vault.gather_config()
+            vault.save()
+        if added:
+            ui.info(f"gathered from profiles: {', '.join(added)}")
     targets = [vault.resolve(args.name)] if args.name else vault.profiles
     if not [p for p in targets if not p.is_default]:
         ui.note("  nothing to sync — ~/.claude.json is the source, not a target")
@@ -763,6 +1582,111 @@ def cmd_sync(vault: Vault, args) -> int:
     if touched:
         ui.success(f"synced {touched} profile(s) from ~/.claude.json")
     return 0
+
+
+#: (label, function, extra kwargs) for every step `sync-all` runs, in order.
+def _sync_all_steps(dry_run: bool) -> list[tuple[str, Any, dict]]:
+    return [
+        ("CLI links", cmd_relink, {"name": None, "force": False}),
+        ("MCP servers and trusted folders", cmd_sync, {"name": None, "gather": True}),
+        # Repairing is the whole point of this button: a profile that kept its
+        # own copy of a shared entry is exactly the state the user is trying to
+        # get out of, and the copy is preserved under .shadowed either way.
+        ("app links", cmd_app_relink, {"name": None, "force": True}),
+        ("chat pool links", cmd_app_link, {"name": None}),
+        ("existing chats", cmd_app_adopt, {"dry_run": dry_run, "yes": True}),
+    ]
+
+
+def cmd_sync_all(vault: Vault, args) -> int:
+    """Make everything shareable shared, in one idempotent pass.
+
+    The steps already exist as separate commands; the value here is not having
+    to remember which of them applies to what.  A failing step does not cancel
+    the rest — half the work done and named beats nothing done.
+    """
+    bootstrap(vault)
+    dry_run = getattr(args, "dry_run", False)
+    failed: list[str] = []
+    for label, handler, kwargs in _sync_all_steps(dry_run):
+        ui.info("")
+        ui.info(ui.paint(label, "bold"))
+        try:
+            if handler(vault.reload(), argparse.Namespace(**kwargs)):
+                failed.append(label)
+        except ClaudeLoginError as exc:
+            failed.append(label)
+            ui.error(str(exc))
+    ui.info("")
+    if failed:
+        ui.warn(f"finished with problems in: {', '.join(failed)}")
+        return 1
+    ui.success("everything that can be shared is shared")
+    return 0
+
+
+def cmd_setup(vault: Vault, args) -> int:
+    """Walk a new machine from nothing to working. Safe to run again."""
+    bootstrap(vault)
+    ui.info(ui.paint("claude-login setup", "bold"))
+    ui.info("")
+
+    ui.info(ui.paint("what is installed", "bold"))
+    try:
+        ui.info(f"  claude          {claude_cli.find_claude()}")
+    except ClaudeLoginError as exc:
+        ui.info(f"  claude          {ui.paint('missing', 'red')} — {exc}")
+    if claude_app.available():
+        ui.info(f"  Claude app      {claude_app.app_bundle()}")
+    else:
+        ui.info(
+            f"  Claude app      {ui.paint('not found', 'yellow')} at "
+            f"{claude_app.app_bundle()} — the CLI half works without it"
+        )
+
+    ui.info("")
+    ui.info(ui.paint("accounts", "bold"))
+    for profile in vault.profiles:
+        ui.info(f"  {profile.display}  {ui.paint(describe(profile), 'grey')}")
+    if not vault.profiles:
+        ui.info("  (none yet)")
+
+    if not ui.is_interactive():
+        ui.info("")
+        ui.note("  not a terminal — run `claude-login setup` from one to continue")
+        return 0
+
+    while ui.confirm("Add an account now?", default=not vault.profiles):
+        _run_add(vault, args)
+        vault.reload()
+
+    if len(vault.profiles) < 2:
+        ui.note("  one account is enough to start; add the second whenever you like")
+
+    if claude_app.available() and ui.confirm(
+        "Launch the Claude app by default instead of the CLI?", default=False
+    ):
+        with vault.locked():
+            vault.set_launch_target("app")
+            vault.save()
+
+    cmd_sync_all(vault.reload(), argparse.Namespace(dry_run=False))
+
+    ui.info("")
+    ui.info(ui.paint("what to click from now on", "bold"))
+    for name, what in SCRIPT_SUMMARY:
+        ui.info(f"  scripts/{name:<24} {ui.paint(what, 'grey')}")
+    return 0
+
+
+#: Kept next to the scripts themselves so `setup` and the README agree.
+SCRIPT_SUMMARY = (
+    ("setup.command", "this walkthrough"),
+    ("add-account.command", "sign a new account in and open a clean window for it"),
+    ("open-accounts.command", "open the app under every chosen account"),
+    ("sync-all.command", "share skills, MCP servers and chats across accounts"),
+    ("doctor.command", "diagnose what is wired and what is not"),
+)
 
 
 def cmd_doctor(vault: Vault, args) -> int:
@@ -824,12 +1748,75 @@ def cmd_doctor(vault: Vault, args) -> int:
     if not vault.profiles:
         ui.info("  (none yet)")
 
+    problems += _doctor_app(vault)
+
     ui.info("")
     if problems:
         ui.warn(f"{problems} issue(s) found — `claude-login prune` cleans up dead profiles")
     else:
         ui.success("everything looks healthy")
     return 0
+
+
+def _doctor_app(vault: Vault) -> int:
+    """The Claude desktop app half of `doctor`. Returns the problem count."""
+    problems = 0
+    ui.info("")
+    ui.info(ui.paint("Claude desktop app", "bold"))
+    if claude_app.available():
+        ui.info(f"  bundle          {claude_app.app_bundle()}")
+    else:
+        ui.info(
+            f"  bundle          {ui.paint('not found', 'yellow')}"
+            f" at {claude_app.app_bundle()}"
+        )
+    ui.info(f"  support dir     {claude_app.default_app_support_dir()}")
+    ui.info(f"  launch target   {target_label(vault.launch_target)}")
+    running = claude_app.running_pids()
+    if running:
+        ui.info(f"  running         {len(running)}: {', '.join(map(str, running))}")
+    for open_dir in sorted(claude_app.running_data_dirs()):
+        ui.info(f"  open profile    {open_dir}")
+
+    for label, data_dir in app_data_dirs(vault):
+        unpooled = [
+            leaf for leaf in claude_app.session_leaf_dirs(data_dir) if not leaf.is_symlink()
+        ]
+        if unpooled and vault.sharing_enabled:
+            problems += 1
+            ui.info(
+                f"  {ui.paint('not pooled', 'yellow')}      {label}: {len(unpooled)}"
+                " chat directory(ies)  (fix with `claude-login app adopt`)"
+            )
+
+    for profile in vault.profiles:
+        data_dir = vault.app_data_dir_for(profile)
+        status = claude_app.app_status(data_dir)
+        ui.info(f"  {ui.paint(profile.display, 'bold')}  {status.state}")
+        ui.info(f"    data dir      {data_dir}")
+        if (
+            status.account_uuid
+            and profile.account_uuid
+            and status.account_uuid != profile.account_uuid
+        ):
+            problems += 1
+            ui.info(
+                f"    {ui.paint('wrong account', 'yellow')} the app profile is signed"
+                f" in as {status.account_uuid}"
+            )
+        missing, diverged = vault.app_shared_conflicts(profile)
+        if missing:
+            ui.info(
+                f"    {ui.paint('unlinked', 'yellow')}      {', '.join(missing)}"
+                "  (fix with `claude-login app relink`)"
+            )
+        if diverged:
+            problems += 1
+            ui.info(
+                f"    {ui.paint('diverged', 'yellow')}      {', '.join(diverged)}"
+                "  (`claude-login app relink --force`)"
+            )
+    return problems
 
 
 # --- interactive entry point ----------------------------------------------
@@ -839,6 +1826,7 @@ def interactive(vault: Vault, args) -> int:
     bootstrap(vault)
     actions = [
         picker.Action("a", "add"),
+        picker.Action("o", "other target", needs_item=True),
         picker.Action("s", "settings"),
         picker.Action("r", "reload"),
         picker.Action("d", "delete", needs_item=True),
@@ -885,14 +1873,21 @@ def interactive(vault: Vault, args) -> int:
 
         if result.action == picker.CANCEL:
             return 0
-        if result.action == "select" and result.item:
+        if result.action in ("select", "o") and result.item:
             profile: Profile = result.item.value
-            status = vault.status(profile)
-            if not status.usable and not _offer_login(vault, profile, status, assume_yes=False):
-                continue
+            target = (
+                resolve_target(vault, args)
+                if result.action == "select"
+                else other_target(base_target(vault, args))
+            )
+            if target == "cli":
+                status = vault.status(profile)
+                if not status.usable and not _offer_login(
+                    vault, profile, status, assume_yes=False
+                ):
+                    continue
             profile = vault.reload().get(profile.name)
-            launch(vault, profile, list(args.claude_args or []), launch_args_for(vault, args))
-            return 0  # unreachable: exec replaced us
+            return dispatch(vault, profile, args, target)
         if result.action == "a":
             _run_add(vault, args)
         elif result.action == "s":
