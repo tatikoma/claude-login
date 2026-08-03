@@ -29,6 +29,7 @@ from claude_login import (  # noqa: E402
     cli,
     commands,
     keychain,
+    picker,
     store,
     ui,
     usage,
@@ -136,6 +137,11 @@ class Base(unittest.TestCase):
         self._patch(ui, "is_interactive", lambda: False)
         self._env("CLAUDE_LOGIN_CLAUDE_BIN", str(binary))
         self._env("FAKE_CLAUDE_EMAIL", "one@example.com")
+        # Patching the config dir is not enough: `config_dir=None` names the
+        # machine-wide keychain item, so on a signed-in machine `bootstrap`
+        # would adopt the developer's own login as the "default" profile and
+        # every account count would be off by one. A per-run prefix cannot match.
+        self._env("CLAUDE_LOGIN_KEYCHAIN_PREFIX", f"claude-login-test-{os.getpid()}")
 
         self.vault = Vault(self.tmp / "vault")
         # Credentials are memoised per process; tests poke the files directly.
@@ -772,6 +778,79 @@ class TestTableLayout(unittest.TestCase):
 
     def test_table_without_headers_still_renders(self):
         self.assertEqual(ui.render_table([], [["a", "b"]]), "a  b")
+
+    def test_truncate_measures_visible_columns_only(self):
+        cut = ui.truncate("\x1b[32mabcdefgh\x1b[0m", 5)
+        self.assertEqual(ui.width(cut), 5)
+        self.assertEqual(ui.strip_ansi(cut), "abcd…")
+        self.assertTrue(cut.endswith("\x1b[0m"))  # the cut colour is closed again
+
+    def test_truncate_leaves_text_that_already_fits(self):
+        self.assertEqual(ui.truncate("abc", 5), "abc")
+
+
+class TestPickerLayout(unittest.TestCase):
+    """The picker redraws by cursor arithmetic, so no line may wrap on its own."""
+
+    HEADERS = ("ACCOUNT", "PLAN", "5H", "WEEK", "STATUS")
+    ROWS = [
+        ["me@home.com", "max", "10% ⟳ 03:19", "68% ⟳ 04.08 22:59", "expires in 2d"],
+        ["work@example.com", "team", " 6% ⟳ 05:20", "98% ⟳ 05.08 01:00 · Fable 100%", "ok"],
+        ["someone@example.com", "team", "   —", "   —", "not signed in"],
+    ]
+    ACTIONS = [
+        picker.Action(key, text)
+        for key, text in (
+            ("a", "add"),
+            ("o", "other target"),
+            ("s", "settings"),
+            ("r", "reload"),
+            ("d", "delete"),
+            ("p", "prune"),
+        )
+    ]
+
+    def layout(self, limit: int) -> list[str]:
+        return picker._layout(
+            [picker.Item(cells=row) for row in self.ROWS],
+            0,
+            self.ACTIONS,
+            "Select a Claude Code account",
+            self.HEADERS,
+            limit=limit,
+        )
+
+    def plain(self, limit: int) -> str:
+        return "\n".join(ui.strip_ansi(line) for line in self.layout(limit))
+
+    def test_no_line_is_wider_than_the_terminal(self):
+        for limit in (40, 60, 80, 100, 200):
+            widest = max(ui.width(line) for line in self.layout(limit))
+            self.assertLessEqual(widest, limit, f"at {limit} columns")
+
+    def test_hints_fold_instead_of_letting_the_terminal_wrap(self):
+        folded = [line for line in self.layout(80) if "prune" in ui.strip_ansi(line)]
+        self.assertEqual(len(folded), 1)
+        self.assertNotIn("↑↓", ui.strip_ansi(folded[0]))
+
+    def test_the_gap_narrows_before_any_text_is_cut(self):
+        body = self.plain(84)  # two columns too narrow for the wide gap
+        self.assertNotIn("…", body)
+        self.assertIn("someone@example.com", body)
+
+    def test_the_name_column_gives_way_before_the_numbers(self):
+        body = self.plain(80)
+        self.assertIn("Fable 100%", body)
+        self.assertIn("someone@e", body)
+        self.assertNotIn("someone@example.com", body)
+
+    def test_a_wide_terminal_keeps_every_cell_whole(self):
+        body = self.plain(120)
+        self.assertIn("someone@example.com", body)
+        self.assertNotIn("…", body)
+
+    def test_a_column_is_never_squeezed_to_nothing(self):
+        self.assertTrue(all(w >= picker.MIN_COLUMN for w in picker._fit([40, 40, 40], 12)))
 
 
 class TestUsageRendering(unittest.TestCase):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import sys
 from datetime import datetime, timezone
 from typing import Iterable, Sequence
@@ -62,6 +63,39 @@ def pad(text: str, target: int, align: str = "<") -> str:
         left = missing // 2
         return " " * left + text + " " * (missing - left)
     return text + " " * missing
+
+
+def truncate(text: str, limit: int) -> str:
+    """Cut to `limit` columns, marking the loss with `…`.
+
+    Colour codes are carried over rather than counted, so a cut never lands in
+    the middle of an escape sequence and leaves the terminal painted.
+    """
+    if limit <= 0:
+        return ""
+    if width(text) <= limit:
+        return text
+    kept: list[str] = []
+    seen, index = 0, 0
+    while index < len(text) and seen < limit - 1:
+        match = _ANSI_RE.match(text, index)
+        if match:
+            kept.append(match.group())
+            index = match.end()
+            continue
+        kept.append(text[index])
+        seen += 1
+        index += 1
+    # The cut may have dropped the reset that closed a coloured run.
+    return "".join(kept) + "…" + ("\x1b[0m" if "\x1b[" in text else "")
+
+
+def terminal_width(default: int = 80) -> int:
+    """Columns available for output, falling back to 80 for pipes and CI."""
+    try:
+        return max(20, shutil.get_terminal_size((default, 24)).columns)
+    except Exception:
+        return default
 
 
 # --- message helpers -------------------------------------------------------
