@@ -789,6 +789,29 @@ class TestTableLayout(unittest.TestCase):
         self.assertEqual(ui.truncate("abc", 5), "abc")
 
 
+class _Sink:
+    """Stands in for the picker's write end; keeps whatever was drawn."""
+
+    def __init__(self) -> None:
+        self.text = ""
+
+    def write(self, chunk: str) -> None:
+        self.text += chunk
+
+    def flush(self) -> None:
+        pass
+
+
+@contextlib.contextmanager
+def _window(columns: int):
+    original = ui.terminal_width
+    ui.terminal_width = lambda default=80: columns
+    try:
+        yield
+    finally:
+        ui.terminal_width = original
+
+
 class TestPickerLayout(unittest.TestCase):
     """The picker redraws by cursor arithmetic, so no line may wrap on its own."""
 
@@ -851,6 +874,34 @@ class TestPickerLayout(unittest.TestCase):
 
     def test_a_column_is_never_squeezed_to_nothing(self):
         self.assertTrue(all(w >= picker.MIN_COLUMN for w in picker._fit([40, 40, 40], 12)))
+
+    def test_every_trimmed_column_comes_back_as_the_window_widens(self):
+        """Nothing remembers being trimmed: each frame is laid out from scratch."""
+        trimmed = [self.plain(limit).count("…") for limit in (70, 80, 84, 120)]
+        self.assertEqual(trimmed, sorted(trimmed, reverse=True), trimmed)
+        self.assertGreater(trimmed[0], 1)  # more than just the name column
+        self.assertEqual(trimmed[-1], 0)
+
+    def test_a_plain_redraw_rewinds_by_the_frame_height(self):
+        terminal = picker._Terminal(read_fd=-1, write=_Sink())
+        with _window(100):
+            terminal.render(["a", "b", "c"])
+            terminal.write.text = ""
+            terminal.render(["a", "b", "c"])
+        self.assertTrue(terminal.write.text.startswith("\x1b[3A"), terminal.write.text[:12])
+
+    def test_a_resize_repaints_from_the_top_instead_of_counting_rows(self):
+        """Re-wrapped rows put the old frame somewhere no count can find."""
+        terminal = picker._Terminal(read_fd=-1, write=_Sink())
+        with _window(100):
+            terminal.render(["a", "b", "c"])
+        terminal.write.text = ""
+        terminal.restart()
+        with _window(60):
+            terminal.render(["a"])
+        drawn = terminal.write.text
+        self.assertTrue(drawn.startswith("\x1b[H\x1b[2J"), drawn[:12])
+        self.assertNotIn("\x1b[3A", drawn)
 
 
 class TestUsageRendering(unittest.TestCase):

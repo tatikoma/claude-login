@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import select
-import shutil
 import sys
 import termios
 import tty
@@ -92,6 +91,19 @@ class _Terminal:
         self._lines = max(len(lines), self._lines)
         self.write.write("".join(out))
         self.write.flush()
+
+    def restart(self) -> None:
+        """Drop the frame on screen and repaint from the top-left instead.
+
+        A resize is the one event the cursor arithmetic cannot survive: the
+        emulator re-wraps what is already on screen, by rules that differ
+        between terminals, so nothing tells us where the old frame now begins.
+        Counting more cleverly cannot fix that — only starting from a position
+        we know can, at the cost of the screen the list was drawn over.
+        """
+        self.write.write("\x1b[H\x1b[2J")
+        self.write.flush()
+        self._lines = 0
 
     def clear(self) -> None:
         if not self._lines:
@@ -347,6 +359,10 @@ def pick(
     ``poll`` is checked while idle and, when it returns True, the rows are
     rebuilt.  That is how the list paints immediately and fills in slow data
     (rate-limit usage) as it lands, instead of waiting for it up front.
+
+    The idle wait is always bounded, even without ``poll``, so a resized window
+    is noticed within one tick: the columns are laid out afresh every frame, so
+    room won back by a wider window undoes the trimming of its own accord.
     """
     resolved = _resolve(items)
     if not resolved and not actions:
@@ -361,10 +377,12 @@ def pick(
     action_keys = {a.key: a for a in actions}
     selected = max(0, min(initial, len(resolved) - 1)) if resolved else 0
     dirty = True
+    drawn_at = 0
 
     with terminal:
         while True:
             if dirty:
+                drawn_at = ui.terminal_width()
                 terminal.render(
                     _layout(
                         resolved, selected, actions, _text(title), headers, enter_label, quit_label
@@ -372,13 +390,17 @@ def pick(
                 )
                 dirty = False
             try:
-                key = terminal.read_key(POLL_SECONDS if poll else None)
+                key = terminal.read_key(POLL_SECONDS)
             except KeyboardInterrupt:
                 terminal.clear()
                 return Result(CANCEL)
 
             if key == TIMEOUT:
-                # Nothing typed; let the caller drop in freshly arrived data.
+                # Nothing typed; catch up on a resized window and on data that
+                # the caller has meanwhile finished fetching.
+                if ui.terminal_width() != drawn_at:
+                    terminal.restart()
+                    dirty = True
                 if poll and poll():
                     resolved = _resolve(items)
                     selected = min(selected, len(resolved) - 1) if resolved else 0
