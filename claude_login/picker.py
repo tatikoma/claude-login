@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import select
-import shutil
 import sys
 import termios
 import tty
@@ -92,6 +91,19 @@ class _Terminal:
         self._lines = max(len(lines), self._lines)
         self.write.write("".join(out))
         self.write.flush()
+
+    def restart(self) -> None:
+        """Drop the frame on screen and repaint from the top-left instead.
+
+        A resize is the one event the cursor arithmetic cannot survive: the
+        emulator re-wraps what is already on screen, by rules that differ
+        between terminals, so nothing tells us where the old frame now begins.
+        Counting more cleverly cannot fix that — only starting from a position
+        we know can, at the cost of the screen the list was drawn over.
+        """
+        self.write.write("\x1b[H\x1b[2J")
+        self.write.flush()
+        self._lines = 0
 
     def clear(self) -> None:
         if not self._lines:
@@ -199,6 +211,15 @@ def supported() -> bool:
     return True
 
 
+#: Two columns for the selection marker.
+MARKER_WIDTH = 2
+#: Gaps between columns, widest first. The narrow one is tried before any text
+#: is cut: tight spacing still reads, a trimmed account name does not.
+GAPS = ("  ", " ")
+#: Never squeeze a column past this: a two-letter stub identifies nothing.
+MIN_COLUMN = 8
+
+
 def _column_widths(rows: Sequence[Sequence[str]]) -> list[int]:
     count = max((len(r) for r in rows), default=0)
     widths = [0] * count
@@ -206,6 +227,50 @@ def _column_widths(rows: Sequence[Sequence[str]]) -> list[int]:
         for index, cell in enumerate(row):
             widths[index] = max(widths[index], ui.width(cell))
     return widths
+
+
+def _fit(widths: Sequence[int], budget: int) -> list[int]:
+    """Squeeze columns into `budget`, taking from the first column first.
+
+    Column zero holds the row's name, which stays recognisable from its start —
+    a trimmed `someone@examp…` still picks out the account.  The value
+    columns lose their meaning outright once cut (`98% ⟳ 05.08 01:00 · Fa…`),
+    so they are only touched when trimming the name is not enough, and then
+    always the widest of them, so the loss spreads instead of gutting one.
+    """
+    result = list(widths)
+    excess = sum(result) - budget
+    if excess <= 0 or not result:
+        return result
+    give = min(excess, max(0, result[0] - MIN_COLUMN))
+    result[0] -= give
+    excess -= give
+    while excess > 0:
+        index = max(range(len(result)), key=lambda i: result[i])
+        if result[index] <= MIN_COLUMN:
+            break  # everything is at the floor; the caller cuts the line instead
+        result[index] -= 1
+        excess -= 1
+    return result
+
+
+def _wrap_hints(parts: Sequence[str], limit: int) -> list[str]:
+    """Fold the key hints onto as many lines as they need.
+
+    The picker redraws by moving the cursor up over a known number of lines, so
+    a line the terminal wraps on its own puts every following frame out of step
+    and the list starts overwriting itself.  Wrapping here keeps the count ours.
+    """
+    lines: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current} · {part}" if current else part
+        if current and ui.width(candidate) > limit:
+            lines.append(current)
+            current = part
+        else:
+            current = candidate
+    return lines + [current] if current else lines
 
 
 def _layout(
@@ -216,20 +281,31 @@ def _layout(
     headers: Sequence[str] = (),
     enter_label: str = "launch",
     quit_label: str = "quit",
+    *,
+    limit: Optional[int] = None,
 ) -> list[str]:
+    limit = ui.terminal_width() if limit is None else limit
     grid = [list(item.cells) for item in items]
-    widths = _column_widths(grid + ([list(headers)] if headers else []))
+    natural = _column_widths(grid + ([list(headers)] if headers else []))
+    for gap in GAPS:
+        budget = limit - MARKER_WIDTH - len(gap) * max(0, len(natural) - 1)
+        if sum(natural) <= budget:
+            break
+    widths = _fit(natural, max(MIN_COLUMN, budget))
 
     def compose(cells: Sequence[str], marker: str, *, bold_first=False, align="<") -> str:
         parts = [
             ui.pad(
-                ui.paint(cell, "bold") if index == 0 and bold_first else cell,
+                ui.truncate(
+                    ui.paint(cell, "bold") if index == 0 and bold_first else cell,
+                    widths[index],
+                ),
                 widths[index],
                 align,
             )
             for index, cell in enumerate(cells)
         ]
-        return (f"{marker} " + "  ".join(parts)).rstrip()
+        return (f"{marker} " + gap.join(parts)).rstrip()
 
     lines = []
     if headers:
@@ -240,13 +316,16 @@ def _layout(
         marker = ui.paint("❯", "cyan", "bold") if active else " "
         lines.append(compose(item.cells, marker, bold_first=active))
 
-    keys = " · ".join(
+    keys = _wrap_hints(
         [f"{ui.paint('↑↓', 'bold')} move", f"{ui.paint('⏎', 'bold')} {enter_label}"]
         + [f"{ui.paint(a.key, 'bold')} {a.description}" for a in actions]
-        + [f"{ui.paint('q', 'bold')} {quit_label}"]
+        + [f"{ui.paint('q', 'bold')} {quit_label}"],
+        limit,
     )
     header = (title.split("\n") + [""]) if title else []
-    return header + lines + ["", ui.paint(keys, "grey")]
+    frame = header + lines + [""] + [ui.paint(line, "grey") for line in keys]
+    # Last resort: a title or a floored-out row must still not wrap.
+    return [ui.truncate(line, limit) for line in frame]
 
 
 def _resolve(source):
@@ -280,6 +359,10 @@ def pick(
     ``poll`` is checked while idle and, when it returns True, the rows are
     rebuilt.  That is how the list paints immediately and fills in slow data
     (rate-limit usage) as it lands, instead of waiting for it up front.
+
+    The idle wait is always bounded, even without ``poll``, so a resized window
+    is noticed within one tick: the columns are laid out afresh every frame, so
+    room won back by a wider window undoes the trimming of its own accord.
     """
     resolved = _resolve(items)
     if not resolved and not actions:
@@ -294,10 +377,12 @@ def pick(
     action_keys = {a.key: a for a in actions}
     selected = max(0, min(initial, len(resolved) - 1)) if resolved else 0
     dirty = True
+    drawn_at = 0
 
     with terminal:
         while True:
             if dirty:
+                drawn_at = ui.terminal_width()
                 terminal.render(
                     _layout(
                         resolved, selected, actions, _text(title), headers, enter_label, quit_label
@@ -305,13 +390,17 @@ def pick(
                 )
                 dirty = False
             try:
-                key = terminal.read_key(POLL_SECONDS if poll else None)
+                key = terminal.read_key(POLL_SECONDS)
             except KeyboardInterrupt:
                 terminal.clear()
                 return Result(CANCEL)
 
             if key == TIMEOUT:
-                # Nothing typed; let the caller drop in freshly arrived data.
+                # Nothing typed; catch up on a resized window and on data that
+                # the caller has meanwhile finished fetching.
+                if ui.terminal_width() != drawn_at:
+                    terminal.restart()
+                    dirty = True
                 if poll and poll():
                     resolved = _resolve(items)
                     selected = min(selected, len(resolved) - 1) if resolved else 0

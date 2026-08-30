@@ -29,6 +29,7 @@ from claude_login import (  # noqa: E402
     cli,
     commands,
     keychain,
+    picker,
     store,
     ui,
     usage,
@@ -777,6 +778,130 @@ class TestTableLayout(unittest.TestCase):
 
     def test_table_without_headers_still_renders(self):
         self.assertEqual(ui.render_table([], [["a", "b"]]), "a  b")
+
+    def test_truncate_measures_visible_columns_only(self):
+        cut = ui.truncate("\x1b[32mabcdefgh\x1b[0m", 5)
+        self.assertEqual(ui.width(cut), 5)
+        self.assertEqual(ui.strip_ansi(cut), "abcd…")
+        self.assertTrue(cut.endswith("\x1b[0m"))  # the cut colour is closed again
+
+    def test_truncate_leaves_text_that_already_fits(self):
+        self.assertEqual(ui.truncate("abc", 5), "abc")
+
+
+class _Sink:
+    """Stands in for the picker's write end; keeps whatever was drawn."""
+
+    def __init__(self) -> None:
+        self.text = ""
+
+    def write(self, chunk: str) -> None:
+        self.text += chunk
+
+    def flush(self) -> None:
+        pass
+
+
+@contextlib.contextmanager
+def _window(columns: int):
+    original = ui.terminal_width
+    ui.terminal_width = lambda default=80: columns
+    try:
+        yield
+    finally:
+        ui.terminal_width = original
+
+
+class TestPickerLayout(unittest.TestCase):
+    """The picker redraws by cursor arithmetic, so no line may wrap on its own."""
+
+    HEADERS = ("ACCOUNT", "PLAN", "5H", "WEEK", "STATUS")
+    ROWS = [
+        ["me@home.com", "max", "10% ⟳ 03:19", "68% ⟳ 04.08 22:59", "expires in 2d"],
+        ["work@example.com", "team", " 6% ⟳ 05:20", "98% ⟳ 05.08 01:00 · Fable 100%", "ok"],
+        ["someone@example.com", "team", "   —", "   —", "not signed in"],
+    ]
+    ACTIONS = [
+        picker.Action(key, text)
+        for key, text in (
+            ("a", "add"),
+            ("o", "other target"),
+            ("s", "settings"),
+            ("r", "reload"),
+            ("d", "delete"),
+            ("p", "prune"),
+        )
+    ]
+
+    def layout(self, limit: int) -> list[str]:
+        return picker._layout(
+            [picker.Item(cells=row) for row in self.ROWS],
+            0,
+            self.ACTIONS,
+            "Select a Claude Code account",
+            self.HEADERS,
+            limit=limit,
+        )
+
+    def plain(self, limit: int) -> str:
+        return "\n".join(ui.strip_ansi(line) for line in self.layout(limit))
+
+    def test_no_line_is_wider_than_the_terminal(self):
+        for limit in (40, 60, 80, 100, 200):
+            widest = max(ui.width(line) for line in self.layout(limit))
+            self.assertLessEqual(widest, limit, f"at {limit} columns")
+
+    def test_hints_fold_instead_of_letting_the_terminal_wrap(self):
+        folded = [line for line in self.layout(80) if "prune" in ui.strip_ansi(line)]
+        self.assertEqual(len(folded), 1)
+        self.assertNotIn("↑↓", ui.strip_ansi(folded[0]))
+
+    def test_the_gap_narrows_before_any_text_is_cut(self):
+        body = self.plain(84)  # two columns too narrow for the wide gap
+        self.assertNotIn("…", body)
+        self.assertIn("someone@example.com", body)
+
+    def test_the_name_column_gives_way_before_the_numbers(self):
+        body = self.plain(80)
+        self.assertIn("Fable 100%", body)
+        self.assertIn("someone@e", body)
+        self.assertNotIn("someone@example.com", body)
+
+    def test_a_wide_terminal_keeps_every_cell_whole(self):
+        body = self.plain(120)
+        self.assertIn("someone@example.com", body)
+        self.assertNotIn("…", body)
+
+    def test_a_column_is_never_squeezed_to_nothing(self):
+        self.assertTrue(all(w >= picker.MIN_COLUMN for w in picker._fit([40, 40, 40], 12)))
+
+    def test_every_trimmed_column_comes_back_as_the_window_widens(self):
+        """Nothing remembers being trimmed: each frame is laid out from scratch."""
+        trimmed = [self.plain(limit).count("…") for limit in (70, 80, 84, 120)]
+        self.assertEqual(trimmed, sorted(trimmed, reverse=True), trimmed)
+        self.assertGreater(trimmed[0], 1)  # more than just the name column
+        self.assertEqual(trimmed[-1], 0)
+
+    def test_a_plain_redraw_rewinds_by_the_frame_height(self):
+        terminal = picker._Terminal(read_fd=-1, write=_Sink())
+        with _window(100):
+            terminal.render(["a", "b", "c"])
+            terminal.write.text = ""
+            terminal.render(["a", "b", "c"])
+        self.assertTrue(terminal.write.text.startswith("\x1b[3A"), terminal.write.text[:12])
+
+    def test_a_resize_repaints_from_the_top_instead_of_counting_rows(self):
+        """Re-wrapped rows put the old frame somewhere no count can find."""
+        terminal = picker._Terminal(read_fd=-1, write=_Sink())
+        with _window(100):
+            terminal.render(["a", "b", "c"])
+        terminal.write.text = ""
+        terminal.restart()
+        with _window(60):
+            terminal.render(["a"])
+        drawn = terminal.write.text
+        self.assertTrue(drawn.startswith("\x1b[H\x1b[2J"), drawn[:12])
+        self.assertNotIn("\x1b[3A", drawn)
 
 
 class TestUsageRendering(unittest.TestCase):
