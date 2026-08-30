@@ -137,10 +137,10 @@ class Base(unittest.TestCase):
         self._patch(ui, "is_interactive", lambda: False)
         self._env("CLAUDE_LOGIN_CLAUDE_BIN", str(binary))
         self._env("FAKE_CLAUDE_EMAIL", "one@example.com")
-        # Patching the config dir is not enough: `config_dir=None` names the
-        # machine-wide keychain item, so on a signed-in machine `bootstrap`
-        # would adopt the developer's own login as the "default" profile and
-        # every account count would be off by one. A per-run prefix cannot match.
+        # The unscoped item name is the developer's own: with ~/.claude signed in
+        # on this machine, `adopt_default` would read a real login and every test
+        # that counts profiles would shift by one.  A name nothing can match
+        # keeps the suite off real accounts — reads miss, and no unit test writes.
         self._env("CLAUDE_LOGIN_KEYCHAIN_PREFIX", f"claude-login-test-{os.getpid()}")
 
         self.vault = Vault(self.tmp / "vault")
@@ -943,7 +943,9 @@ class TestUsageRendering(unittest.TestCase):
         self.assertIsNone(self.parse(payload).weekly_scoped)
 
     def test_reset_time_is_always_shown(self):
-        soon = datetime.now().astimezone() + timedelta(hours=2)
+        # Pinned to today's calendar day: `now + 2h` crossed midnight when the
+        # suite ran late in the evening, and the renderer rightly added the date.
+        soon = datetime.now().astimezone().replace(hour=23, minute=59, second=0, microsecond=0)
         rendered = ui.strip_ansi(usage.render(usage.Window(42.0, soon), weekly=False))
         self.assertEqual(rendered.strip(), f"42% ⟳ {soon.strftime('%H:%M')}")
 
@@ -1127,6 +1129,19 @@ class _AppBase(Base):
         path.write_text(json.dumps({"sessionId": name, "lastActivityAt": activity}))
         return path
 
+    def pooled(self, org: str, name: str) -> Path:
+        """Where a chat ends up: the pool holds one directory per organisation."""
+        return self.vault.pool_dir(claude_app.SESSIONS_DIRNAME) / org / f"{name}.json"
+
+    @staticmethod
+    def is_pooled(leaf: Path) -> bool:
+        """True when a chat directory reaches the pool through its account link.
+
+        The link is on the account, never on the leaf: a symlinked leaf is the
+        one thing the app refuses to write to.
+        """
+        return leaf.parent.is_symlink() and not leaf.is_symlink()
+
 
 class TestAppSharedLinks(_AppBase):
     def setUp(self) -> None:
@@ -1222,22 +1237,45 @@ class TestSessionPool(_AppBase):
         self.chat(leaf, "local_one", 10)
         plan = self.vault.wire_session_pool(str(self.app_support))
         pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "local_one.json").is_file())
-        self.assertTrue(leaf.is_symlink())
-        self.assertEqual(os.path.realpath(leaf), os.path.realpath(pool))
+        self.assertTrue(self.pooled("org-1", "local_one").is_file())
+        self.assertTrue(self.is_pooled(leaf))
+        self.assertEqual(os.path.realpath(leaf.parent), os.path.realpath(pool))
         self.assertEqual(plan.moved, 1)
 
-    def test_two_accounts_end_up_in_one_pool(self):
+    def test_the_leaf_the_app_writes_to_stays_a_real_directory(self):
+        """The app opens it with O_DIRECTORY|O_NOFOLLOW, so a link there is ENOTDIR
+        and every single chat save fails.  The link belongs one level up."""
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        self.vault.wire_session_pool(str(self.app_support))
+        self.assertFalse(claude_app.rejects_leaf(leaf))
+        self.assertTrue(leaf.is_dir())
+        self.assertTrue(leaf.parent.is_symlink())
+
+    def test_two_accounts_of_one_organisation_end_up_in_one_directory(self):
+        first = self.leaf(self.app_support, "acct-a", "org-1")
+        second = self.leaf(self.app_support, "acct-b", "org-1")
+        self.chat(first, "local_one", 10)
+        self.chat(second, "local_two", 20)
+        self.vault.wire_session_pool(str(self.app_support))
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        self.assertEqual(
+            sorted(p.name for p in (pool / "org-1").iterdir()),
+            ["local_one.json", "local_two.json"],
+        )
+        self.assertEqual(os.path.realpath(first), os.path.realpath(second))
+
+    def test_different_organisations_keep_their_own_lists(self):
+        """Not a shortcoming we can design away: the organisation uuid is the last
+        component of the path, and only the app is allowed to create it."""
         first = self.leaf(self.app_support, "acct-a", "org-1")
         second = self.leaf(self.app_support, "acct-b", "org-2")
         self.chat(first, "local_one", 10)
         self.chat(second, "local_two", 20)
         self.vault.wire_session_pool(str(self.app_support))
         pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertEqual(
-            sorted(p.name for p in pool.iterdir()),
-            ["local_one.json", "local_two.json"],
-        )
+        self.assertEqual(sorted(p.name for p in pool.iterdir()), ["org-1", "org-2"])
+        self.assertNotEqual(os.path.realpath(first), os.path.realpath(second))
 
     def test_backup_is_taken_before_the_first_move(self):
         leaf = self.leaf(self.app_support, "acct-a", "org-1")
@@ -1261,22 +1299,21 @@ class TestSessionPool(_AppBase):
         self.vault.wire_session_pool(str(self.app_support))
         again = self.vault.wire_session_pool(str(self.app_support))
         self.assertEqual(again.moved, 0)
-        self.assertTrue(leaf.is_symlink())
+        self.assertTrue(self.is_pooled(leaf))
 
     def test_collision_keeps_the_newer_chat(self):
         first = self.leaf(self.app_support, "acct-a", "org-1")
-        second = self.leaf(self.app_support, "acct-b", "org-2")
+        second = self.leaf(self.app_support, "acct-b", "org-1")
         self.chat(first, "local_same", 10)
         self.chat(second, "local_same", 99)
         plan = self.vault.wire_session_pool(str(self.app_support))
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        kept = json.loads((pool / "local_same.json").read_text())
+        kept = json.loads(self.pooled("org-1", "local_same").read_text())
         self.assertEqual(kept["lastActivityAt"], 99)
         self.assertEqual(plan.collisions, 1)
 
     def test_the_loser_of_a_clash_is_kept_aside(self):
         first = self.leaf(self.app_support, "acct-a", "org-1")
-        second = self.leaf(self.app_support, "acct-b", "org-2")
+        second = self.leaf(self.app_support, "acct-b", "org-1")
         self.chat(first, "local_same", 10)
         self.chat(second, "local_same", 99)
         self.vault.wire_session_pool(str(self.app_support))
@@ -1288,9 +1325,8 @@ class TestSessionPool(_AppBase):
         leaf = self.leaf(self.app_support, "acct-new", "org-9")
         self.chat(leaf, "local_late", 5)
         self.vault.wire_session_pool(str(self.app_support))
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "local_late.json").is_file())
-        self.assertTrue(leaf.is_symlink())
+        self.assertTrue(self.pooled("org-9", "local_late").is_file())
+        self.assertTrue(self.is_pooled(leaf))
 
     def test_only_the_code_tab_index_is_pooled(self):
         self.assertEqual(list(store.POOL_DIRNAMES), [claude_app.SESSIONS_DIRNAME])
@@ -1305,7 +1341,7 @@ class TestSessionPool(_AppBase):
         self.chat(leaf, "local_one", 10)
         self.vault.wire_session_pool(str(self.app_support))
         self.assertEqual(self.vault.unwire_session_pool(str(self.app_support)), 1)
-        self.assertFalse(leaf.is_symlink())
+        self.assertFalse(leaf.parent.is_symlink())
         self.assertTrue((leaf / "local_one.json").is_file())
 
     def test_a_directory_inside_a_leaf_is_never_deleted(self):
@@ -1318,7 +1354,7 @@ class TestSessionPool(_AppBase):
         (workspace / "keep-me.txt").write_text("precious")
         plan = self.vault.wire_session_pool(str(self.app_support))
         self.assertTrue((workspace / "keep-me.txt").is_file())
-        self.assertFalse(leaf.is_symlink())
+        self.assertFalse(leaf.parent.is_symlink())
         self.assertTrue(any("cowork_plugins" in entry for entry in plan.unmoved))
 
     def test_agent_mode_sessions_are_left_alone_entirely(self):
@@ -1327,6 +1363,7 @@ class TestSessionPool(_AppBase):
         (leaf / "rpm").mkdir()
         self.vault.wire_session_pool(str(self.app_support))
         self.assertFalse(leaf.is_symlink())
+        self.assertFalse(leaf.parent.is_symlink())
         self.assertTrue((leaf / "local_agent.json").is_file())
         self.assertTrue((leaf / "rpm").is_dir())
 
@@ -1335,7 +1372,83 @@ class TestSessionPool(_AppBase):
         (leaf / "scheduled-tasks.json").write_text("{}")
         self.vault.wire_session_pool(str(self.app_support))
         pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "scheduled-tasks.json").is_file())
+        self.assertTrue((pool / "org-1" / "scheduled-tasks.json").is_file())
+
+    def test_a_flat_pool_is_split_per_organisation(self):
+        """Pools written before the app refused symlinked leaves are one pile of
+        files.  Nothing in a chat says which organisation it belongs to and every
+        account has been reading the same list, so each organisation gets it."""
+        self.leaf(self.app_support, "acct-a", "org-1")
+        self.leaf(self.app_support, "acct-b", "org-2")
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        pool.mkdir(parents=True)
+        self.chat(pool, "local_old", 7)
+        self.assertEqual(self.vault.migrate_flat_pool(), 1)
+        self.assertTrue(self.pooled("org-1", "local_old").is_file())
+        self.assertTrue(self.pooled("org-2", "local_old").is_file())
+        self.assertFalse((pool / "local_old.json").exists())
+
+    def test_splitting_a_flat_pool_twice_changes_nothing(self):
+        self.leaf(self.app_support, "acct-a", "org-1")
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        pool.mkdir(parents=True)
+        self.chat(pool, "local_old", 7)
+        self.vault.migrate_flat_pool()
+        self.assertEqual(self.vault.migrate_flat_pool(), 0)
+
+    def test_an_older_backup_does_not_block_the_link(self):
+        """A `.replaced-` directory from an earlier fold-in is ours, not unknown
+        data: the account directory is renamed aside so nothing is deleted, and
+        the link still gets made."""
+        leaf = self.leaf(self.app_support, "acct-a", "org-1")
+        self.chat(leaf, "local_one", 10)
+        backup = leaf.parent / f"org-1{claude_app.REPLACED_MARKER}1"
+        backup.mkdir()
+        (backup / "keep-me.json").write_text("{}")
+        plan = self.vault.wire_session_pool(str(self.app_support))
+        self.assertEqual(plan.unmoved, [])
+        self.assertTrue(self.is_pooled(leaf))
+        root = self.app_support / claude_app.SESSIONS_DIRNAME
+        aside = list(root.glob(f"acct-a{claude_app.REPLACED_MARKER}*"))
+        self.assertEqual(len(aside), 1)
+        carried = aside[0] / f"org-1{claude_app.REPLACED_MARKER}1" / "keep-me.json"
+        self.assertTrue(carried.is_file())
+
+    def test_a_dead_agent_mode_link_is_removed(self):
+        """Left over from when agent-mode was pooled too.  It points nowhere, so
+        it holds nothing — but while it is there the app saves no agent-mode
+        session at all, because it refuses a symlinked directory outright."""
+        account = self.app_support / claude_app.AGENT_SESSIONS_DIRNAME / "acct-a"
+        account.mkdir(parents=True)
+        (account / "org-1").symlink_to(self.tmp / "gone")
+        self.assertEqual(
+            self.vault.clear_agent_pool_links(str(self.app_support)), (1, 0)
+        )
+        self.assertFalse((account / "org-1").is_symlink())
+
+    def test_an_agent_mode_link_that_still_resolves_is_left_for_a_human(self):
+        target = self.tmp / "agent-pool"
+        target.mkdir()
+        account = self.app_support / claude_app.AGENT_SESSIONS_DIRNAME / "acct-a"
+        account.mkdir(parents=True)
+        (account / "org-1").symlink_to(target)
+        self.assertEqual(
+            self.vault.clear_agent_pool_links(str(self.app_support)), (0, 1)
+        )
+        self.assertTrue((account / "org-1").is_symlink())
+
+    def test_a_leaf_linked_the_old_way_is_rewired(self):
+        """The layout that broke on 1.25927: the link sat on the leaf itself."""
+        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
+        pool.mkdir(parents=True)
+        self.chat(pool, "local_old", 7)
+        account = self.app_support / claude_app.SESSIONS_DIRNAME / "acct-a"
+        account.mkdir(parents=True)
+        leaf = account / "org-1"
+        leaf.symlink_to(pool)
+        self.vault.wire_session_pool(str(self.app_support))
+        self.assertTrue(self.is_pooled(leaf))
+        self.assertTrue(self.pooled("org-1", "local_old").is_file())
 
 
 class TestOrgUuidLookup(Base):
@@ -1384,9 +1497,8 @@ class TestAppCommands(_AppBase):
         leaf = self.leaf(self.app_support, "acct", "org")
         self.chat(leaf, "local_one")
         commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
-        self.assertTrue(leaf.is_symlink())
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "local_one.json").is_file())
+        self.assertTrue(self.is_pooled(leaf))
+        self.assertTrue(self.pooled("org", "local_one").is_file())
 
     def test_pool_link_is_created_before_the_app_exists(self):
         profile = self.add(email="one@example.com")
@@ -1398,15 +1510,14 @@ class TestAppCommands(_AppBase):
         commands.cmd_app_link(
             self.vault.reload(), argparse.Namespace(name=profile.name)
         )
-        leaf = (
+        link = (
             Path(self.vault.app_data_dir_for(profile))
             / claude_app.SESSIONS_DIRNAME
             / "acct-x"
-            / "org-y"
         )
-        self.assertTrue(leaf.is_symlink())
+        self.assertTrue(link.is_symlink())
         self.assertEqual(
-            os.path.realpath(leaf),
+            os.path.realpath(link),
             os.path.realpath(self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)),
         )
 
@@ -1444,9 +1555,8 @@ class TestAppCommands(_AppBase):
         dead.write_text(json.dumps({"sessionId": "local_dead", "cliSessionId": "gone-1"}))
         self._transcript("live-1")
         commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "local_alive.json").is_file())
-        self.assertFalse((pool / "local_dead.json").exists())
+        self.assertTrue(self.pooled("org", "local_alive").is_file())
+        self.assertFalse(self.pooled("org", "local_dead").exists())
         attic = self.vault.root / store.APP_SHARED_DIRNAME / "orphans"
         self.assertTrue((attic / "local_dead.json").is_file())
 
@@ -1466,8 +1576,7 @@ class TestAppCommands(_AppBase):
         leaf = self.leaf(self.app_support, "acct", "org")
         self.chat(leaf, "local_plain")
         commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "local_plain.json").is_file())
+        self.assertTrue(self.pooled("org", "local_plain").is_file())
 
     def test_sweep_dry_run_moves_nothing(self):
         leaf = self.leaf(self.app_support, "acct", "org")
@@ -1510,20 +1619,18 @@ class TestAppCommands(_AppBase):
         self.chat(leaf, "local_one")
         self._signed_in_as("acct-live")
         commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue(leaf.is_symlink())
-        self.assertTrue((pool / "local_one.json").is_file())
+        self.assertTrue(self.is_pooled(leaf))
+        self.assertTrue(self.pooled("org", "local_one").is_file())
 
     def test_the_original_of_a_live_directory_is_kept(self):
         leaf = self.leaf(self.app_support, "acct-live", "org")
         self.chat(leaf, "local_one")
         self._signed_in_as("acct-live")
         commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
-        aside = [
-            p for p in leaf.parent.iterdir() if p.name.startswith("org.replaced-")
-        ]
+        root = self.app_support / claude_app.SESSIONS_DIRNAME
+        aside = [p for p in root.iterdir() if p.name.startswith("acct-live.replaced-")]
         self.assertEqual(len(aside), 1)
-        self.assertTrue((aside[0] / "local_one.json").is_file())
+        self.assertTrue((aside[0] / "org" / "local_one.json").is_file())
 
     def test_a_dormant_account_moves_while_another_is_signed_in(self):
         live = self.leaf(self.app_support, "acct-live", "org")
@@ -1533,15 +1640,16 @@ class TestAppCommands(_AppBase):
         self._signed_in_as("acct-live")
         commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
         pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue(dormant.is_symlink())
-        self.assertTrue(live.is_symlink())
+        self.assertTrue(self.is_pooled(dormant))
+        self.assertTrue(self.is_pooled(live))
         self.assertEqual(
-            sorted(p.name for p in pool.iterdir()),
+            sorted(p.name for p in (pool / "org").iterdir()),
             ["local_dormant.json", "local_live.json"],
         )
         # The dormant one was moved, the live one only copied.
-        self.assertFalse(list(dormant.parent.glob("org.replaced-*")))
-        self.assertTrue(list(live.parent.glob("org.replaced-*")))
+        root = self.app_support / claude_app.SESSIONS_DIRNAME
+        self.assertFalse(list(root.glob("acct-dormant.replaced-*")))
+        self.assertTrue(list(root.glob("acct-live.replaced-*")))
 
     def test_an_unreadable_signed_in_account_stops_everything(self):
         leaf = self.leaf(self.app_support, "acct-a", "org")
@@ -1563,8 +1671,8 @@ class TestAppCommands(_AppBase):
             claude_app, "is_in_use", lambda path: os.path.normpath(path) == busy
         )
         commands.cmd_app_adopt(self.vault, argparse.Namespace(dry_run=False, yes=True))
-        self.assertFalse(machine_leaf.is_symlink())
-        self.assertTrue(profile_leaf.is_symlink())
+        self.assertFalse(machine_leaf.parent.is_symlink())
+        self.assertTrue(self.is_pooled(profile_leaf))
 
     def test_adopt_is_a_no_op_when_there_is_nothing_to_pool(self):
         self.assertEqual(
@@ -1602,9 +1710,25 @@ class TestAppCommands(_AppBase):
         state = commands._chats_state(self.vault, str(self.app_support))
         self.assertEqual(ui.strip_ansi(state), "private")
 
+    def test_chats_state_reports_shared_once_the_account_is_linked(self):
+        leaf = self.leaf(self.app_support, "acct", "org")
+        self.chat(leaf, "local_one")
+        self.vault.wire_session_pool(str(self.app_support))
+        state = commands._chats_state(self.vault, str(self.app_support))
+        self.assertEqual(ui.strip_ansi(state), "shared")
+
     def test_doctor_mentions_the_app(self):
         self.add(email="one@example.com")
         self.assertEqual(commands.cmd_doctor(self.vault, argparse.Namespace()), 0)
+
+    def test_doctor_flags_a_chat_directory_the_app_refuses(self):
+        """It used to call this healthy while every chat save failed with ENOTDIR
+        — the only place that said so was the app's own log."""
+        leaf = self.leaf(self.app_support, "acct", "org")
+        healthy = commands._doctor_app(self.vault)
+        leaf.rmdir()
+        leaf.symlink_to(self.vault.pool_dir(claude_app.SESSIONS_DIRNAME))
+        self.assertEqual(commands._doctor_app(self.vault), healthy + 1)
 
 
 class TestSettingsSections(Base):
@@ -1745,13 +1869,12 @@ class TestAppLaunch(_AppBase):
             self.vault.save()
         profile = self.vault.reload().get(profile.name)
         commands.launch_app(self.vault, profile, argparse.Namespace())
-        leaf = (
+        link = (
             Path(self.vault.app_data_dir_for(profile))
             / claude_app.SESSIONS_DIRNAME
             / "acct-x"
-            / "org-y"
         )
-        self.assertTrue(leaf.is_symlink())
+        self.assertTrue(link.is_symlink())
 
     def test_the_data_dir_is_remembered_in_the_registry(self):
         profile = self.add(email="one@example.com")
@@ -1770,9 +1893,8 @@ class TestAppLaunch(_AppBase):
         leaf = self.leaf(data_dir, "acct-a", "org-1")
         self.chat(leaf, "local_one", 10)
         commands.launch_app(self.vault, profile, argparse.Namespace())
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "local_one.json").is_file())
-        self.assertTrue(leaf.is_symlink())
+        self.assertTrue(self.pooled("org-1", "local_one").is_file())
+        self.assertTrue(self.is_pooled(leaf))
 
     def test_pooling_is_skipped_while_this_profile_is_open(self):
         self._patch(claude_app, "is_in_use", lambda _dir: True)
@@ -1795,6 +1917,128 @@ class TestAppLaunch(_AppBase):
         commands.dispatch(self.vault, profile, argparse.Namespace(), "app")
         self.assertEqual(len(self.spawned), 1)
 
+    def _window_signed_in_as(self, data_dir: Path, account: str) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "config.json").write_text(
+            json.dumps({"oauth:tokenCacheV2": "djEw", "lastKnownAccountUuid": account})
+        )
+
+    def _accounted(self, profile: Profile, account: str) -> Profile:
+        with self.vault.locked():
+            stored = self.vault.get(profile.name)
+            stored.account_uuid = account
+            self.vault.upsert(stored)
+            self.vault.save()
+        return self.vault.reload().get(profile.name)
+
+    def test_a_window_signed_in_as_another_account_is_refused(self):
+        profile = self._accounted(self.add(email="one@example.com"), "acct-one")
+        self._window_signed_in_as(
+            Path(self.vault.app_data_dir_for(profile)), "acct-two"
+        )
+        before = self.vault.reload().last_used
+        with self.assertRaises(ClaudeAppError):
+            commands.launch_app(self.vault, profile, argparse.Namespace())
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.vault.reload().last_used, before)
+
+    def test_a_mismatched_window_still_opens_with_yes(self):
+        profile = self._accounted(self.add(email="one@example.com"), "acct-one")
+        self._window_signed_in_as(
+            Path(self.vault.app_data_dir_for(profile)), "acct-two"
+        )
+        commands.launch_app(self.vault, profile, argparse.Namespace(yes=True))
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_the_refusal_points_at_the_profile_that_owns_the_account(self):
+        owner = self._accounted(self.add(email="one@example.com"), "acct-one")
+        with self.vault.locked():
+            self.vault.upsert(
+                Profile(
+                    name="default",
+                    config_dir=None,
+                    email="one@example.com",
+                    account_uuid="acct-one",
+                )
+            )
+            self.vault.save()
+        self._window_signed_in_as(self.app_support, "acct-two")
+        default = self.vault.reload().get("default")
+        with self.assertRaises(ClaudeAppError) as caught:
+            commands.launch_app(self.vault, default, argparse.Namespace())
+        self.assertIn(owner.name, str(caught.exception))
+        self.assertEqual(self.spawned, [])
+
+    def _bundle_asar(self, payload: bytes) -> None:
+        asar = Path(os.environ["CLAUDE_LOGIN_APP_PATH"]) / "Contents/Resources/app.asar"
+        asar.parent.mkdir(parents=True, exist_ok=True)
+        asar.write_bytes(payload)
+
+    def _scrubbing_bundle(self) -> None:
+        """Deletes the variable, but still takes --user-data-dir on argv."""
+        self._bundle_asar(
+            b"var MB=[`remote-debugging-port`,`browser-subprocess-path`];"
+            b"(delete process.env.CLAUDE_USER_DATA_DIR,delete process.env.SSLKEYLOGFILE)"
+        )
+
+    def _denylisting_bundle(self) -> None:
+        """Would exit rather than start with --user-data-dir on argv."""
+        self._bundle_asar(
+            b"var MB=[`remote-debugging-port`,`user-data-dir`,`host-rules`];"
+            b"(delete process.env.CLAUDE_USER_DATA_DIR)"
+        )
+
+    def test_a_build_that_only_scrubs_the_variable_still_launches_per_account(self):
+        profile = self.add(email="one@example.com")
+        self._scrubbing_bundle()
+        commands.launch_app(self.vault, profile, argparse.Namespace())
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_an_app_build_that_refuses_the_switch_refuses_a_per_account_launch(self):
+        profile = self.add(email="one@example.com")
+        self._denylisting_bundle()
+        with self.assertRaises(ClaudeAppError):
+            commands.launch_app(self.vault, profile, argparse.Namespace())
+        self.assertEqual(self.spawned, [])
+
+    def test_the_machine_wide_default_still_launches_on_such_a_build(self):
+        self._denylisting_bundle()
+        with self.vault.locked():
+            self.vault.upsert(Profile(name="default", config_dir=None, email="one@example.com"))
+            self.vault.save()
+        default = self.vault.reload().get("default")
+        commands.launch_app(self.vault, default, argparse.Namespace())
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_the_foreign_window_hint_never_points_at_a_refused_launch(self):
+        owner = self._accounted(self.add(email="one@example.com"), "acct-one")
+        with self.vault.locked():
+            self.vault.upsert(
+                Profile(
+                    name="default",
+                    config_dir=None,
+                    email="one@example.com",
+                    account_uuid="acct-one",
+                )
+            )
+            self.vault.save()
+        self._window_signed_in_as(self.app_support, "acct-two")
+        self._denylisting_bundle()
+        default = self.vault.reload().get("default")
+        with self.assertRaises(ClaudeAppError) as caught:
+            commands.launch_app(self.vault, default, argparse.Namespace())
+        self.assertNotIn(owner.name, str(caught.exception))
+        self.assertEqual(self.spawned, [])
+
+    def test_app_open_skips_a_mismatched_window_and_opens_the_rest(self):
+        bad = self._accounted(self.add(email="one@example.com"), "acct-one")
+        self._window_signed_in_as(Path(self.vault.app_data_dir_for(bad)), "acct-two")
+        good = self.add(name="two", email="two@example.com")
+        args = argparse.Namespace(names=[bad.name, good.name])
+        self.assertEqual(commands.cmd_app_open(self.vault, args), 0)
+        self.assertEqual(len(self.spawned), 1)
+        self.assertEqual(self.spawned[0][0], self.vault.app_data_dir_for(good))
+
     def test_app_target_does_not_require_a_usable_cli_login(self):
         profile = self.add(email="one@example.com")
         claude_cli.delete_credentials(profile.config_dir)
@@ -1803,6 +2047,106 @@ class TestAppLaunch(_AppBase):
         args = argparse.Namespace(name=profile.name, app=True, yes=True, claude_args=[])
         self.assertEqual(commands.cmd_use(self.vault, args), 0)
         self.assertEqual(len(self.spawned), 1)
+
+
+class TestAppScrubDetection(_AppBase):
+    """The packaged app deleting CLAUDE_USER_DATA_DIR at startup (since ~1.34)."""
+
+    def _asar(self, payload: bytes) -> None:
+        asar = Path(os.environ["CLAUDE_LOGIN_APP_PATH"]) / "Contents/Resources/app.asar"
+        asar.parent.mkdir(parents=True, exist_ok=True)
+        asar.write_bytes(payload)
+
+    def test_a_bundle_that_deletes_the_variable_is_detected(self):
+        self.fake_bundle()
+        self._asar(
+            b"E.app.isPackaged&&!qU&&(delete process.env.CLAUDE_USER_DATA_DIR,"
+            b"delete process.env.SSLKEYLOGFILE)"
+        )
+        self.assertTrue(claude_app.scrubs_user_data_dir())
+
+    def test_a_bundle_that_honours_the_variable_is_not(self):
+        self.fake_bundle()
+        self._asar(b"if(process.env.CLAUDE_USER_DATA_DIR){E.app.setPath(`userData`,e)}")
+        self.assertFalse(claude_app.scrubs_user_data_dir())
+
+    def test_a_missing_archive_reads_as_not_scrubbing(self):
+        self.fake_bundle()
+        self.assertFalse(claude_app.scrubs_user_data_dir())
+
+    def test_a_build_that_scrubs_the_variable_still_takes_the_switch(self):
+        self.fake_bundle()
+        self._asar(
+            b"var MB=[`remote-debugging-port`,`host-rules`,`browser-subprocess-path`];"
+            b"E.app.isPackaged&&(delete process.env.CLAUDE_USER_DATA_DIR)"
+        )
+        self.assertTrue(claude_app.scrubs_user_data_dir())
+        self.assertFalse(claude_app.rejects_user_data_switch())
+        self.assertTrue(claude_app.can_relocate_user_data())
+
+    def test_a_denylisted_switch_is_detected(self):
+        self.fake_bundle()
+        self._asar(b"var MB=[`remote-debugging-port`,`user-data-dir`,`host-rules`];")
+        self.assertTrue(claude_app.rejects_user_data_switch())
+        self.assertFalse(claude_app.can_relocate_user_data())
+
+    def test_the_switch_named_outside_the_denylist_does_not_count(self):
+        self.fake_bundle()
+        self._asar(
+            b"var MB=[`remote-debugging-port`,`host-rules`];"
+            b"P.warn(`relocated, ignoring user-data-dir`)"
+        )
+        self.assertFalse(claude_app.rejects_user_data_switch())
+
+    def test_a_bundle_that_never_names_the_switch_cannot_screen_it(self):
+        self.fake_bundle()
+        self._asar(b"delete process.env.CLAUDE_USER_DATA_DIR")
+        self.assertFalse(claude_app.rejects_user_data_switch())
+
+
+class TestAppLaunchArgv(_AppBase):
+    """Chromium reads --user-data-dir before the app can delete the variable."""
+
+    class _Proc:
+        pid = 4242
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.fake_bundle()
+        self.calls: list[list[str]] = []
+        self._patch(claude_app.subprocess, "Popen", self._record)
+
+    def _record(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        return self._Proc()
+
+    def test_a_per_account_directory_is_named_on_the_command_line(self):
+        target = str(self.tmp / "profile-data")
+        self.assertEqual(claude_app.launch(target), 4242)
+        self.assertIn(f"--user-data-dir={target}", self.calls[0])
+
+    def test_the_machine_wide_directory_is_launched_bare(self):
+        claude_app.launch(str(self.app_support))
+        self.assertEqual(len(self.calls[0]), 1)
+
+    def test_the_variable_travels_alongside_the_switch(self):
+        target = str(self.tmp / "profile-data")
+        env = claude_app.child_env(target)
+        self.assertEqual(env["CLAUDE_USER_DATA_DIR"], target)
+
+
+class TestProfileDisplay(unittest.TestCase):
+    def test_the_default_profile_is_marked(self):
+        profile = Profile(name="default", config_dir=None, email="a@b.com")
+        self.assertEqual(profile.display, "a@b.com (default)")
+
+    def test_a_named_profile_shows_the_bare_email(self):
+        profile = Profile(name="a@b.com", config_dir="/x", email="a@b.com")
+        self.assertEqual(profile.display, "a@b.com")
+
+    def test_a_default_with_no_login_stays_plain(self):
+        profile = Profile(name="default", config_dir=None)
+        self.assertEqual(profile.display, "default")
 
 
 class TestAppLayout(unittest.TestCase):
@@ -1931,6 +2275,14 @@ class TestAppContinue(unittest.TestCase):
         (self.pool / "scheduled-tasks.json").write_text("{}")
         self.assertIsNone(claude_app.last_session(self.pool))
 
+    def test_chats_are_found_in_the_per_organisation_directories(self):
+        org = self.pool / "org-1"
+        org.mkdir()
+        (org / "local_a.json").write_text(
+            json.dumps({"sessionId": "local_a", "cwd": "/work", "lastFocusedAt": 400})
+        )
+        self.assertEqual(claude_app.last_session(self.pool)["sessionId"], "local_a")
+
 
 class TestAccountSelection(_AppBase):
     def test_absent_key_means_every_account(self):
@@ -1994,11 +2346,10 @@ class TestPerAccountSharing(_AppBase):
         plan = self.vault.wire_session_pool(
             str(self.app_support), sharing={"acct-shared"}
         )
-        pool = self.vault.pool_dir(claude_app.SESSIONS_DIRNAME)
-        self.assertTrue((pool / "local_shared.json").is_file())
-        self.assertFalse((pool / "local_private.json").exists())
-        self.assertTrue(shared.is_symlink())
-        self.assertFalse(private.is_symlink())
+        self.assertTrue(self.pooled("org", "local_shared").is_file())
+        self.assertFalse(self.pooled("org", "local_private").exists())
+        self.assertTrue(self.is_pooled(shared))
+        self.assertFalse(private.parent.is_symlink())
         self.assertEqual(plan.linked, 1)
 
     def test_none_lets_everybody_in(self):
@@ -2007,8 +2358,8 @@ class TestPerAccountSharing(_AppBase):
         self.chat(first, "local_a")
         self.chat(second, "local_b")
         self.vault.wire_session_pool(str(self.app_support), sharing=None)
-        self.assertTrue(first.is_symlink())
-        self.assertTrue(second.is_symlink())
+        self.assertTrue(self.is_pooled(first))
+        self.assertTrue(self.is_pooled(second))
 
 
 class TestAppOpen(_AppBase):

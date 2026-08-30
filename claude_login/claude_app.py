@@ -1,10 +1,13 @@
 """Everything we know about the Claude desktop app and its on-disk layout.
 
-The app keys its whole user-data directory off ``CLAUDE_USER_DATA_DIR`` — the
-same trick ``CLAUDE_CONFIG_DIR`` plays for the CLI:
+The app keys its whole user-data directory off a directory we choose — the same
+trick ``CLAUDE_CONFIG_DIR`` plays for the CLI, except it is named twice: through
+``CLAUDE_USER_DATA_DIR`` for builds that still read it, and through Chromium's
+own ``--user-data-dir`` switch, which lands in C++ before the app's startup code
+can delete the variable (see ``can_relocate_user_data``):
 
-* user data   -> ``$CLAUDE_USER_DATA_DIR`` (``~/Library/Application Support/Claude``
-                 when unset); the app moves its logs into ``<dir>/Logs`` too
+* user data   -> that directory (``~/Library/Application Support/Claude`` when
+                 neither is given); with the variable the logs move too
 * credentials -> ``<dir>/config.json``, under ``oauth:tokenCacheV2``, encrypted
                  with Electron safeStorage.  We never read the value, only note
                  whether it is there: the app is its own credential provider and
@@ -16,11 +19,15 @@ same trick ``CLAUDE_CONFIG_DIR`` plays for the CLI:
 
 Two instances with different data directories run side by side (verified: there
 is no single-instance lock), so accounts do not have to take turns.
+
+Since 1.25927 the app hardened how it creates that chat directory, and the
+difference decides where our pool link is allowed to sit — see ``rejects_leaf``.
 """
 
 from __future__ import annotations
 
 import json
+import mmap
 import os
 import re
 import subprocess
@@ -91,6 +98,87 @@ def available() -> bool:
     return True
 
 
+#: Plain-text signature of the startup code that strips the variable. String
+#: literals survive minification, which is what makes these stable canaries.
+_SCRUB_MARKER = b"delete process.env.CLAUDE_USER_DATA_DIR"
+#: First entry of the denylist the app screens ``process.argv`` against.
+_DENYLIST_ANCHOR = b"`remote-debugging-port`"
+#: How far past the anchor the denylist literal can plausibly run.
+_DENYLIST_SPAN = 4096
+_SWITCH_NAME = b"user-data-dir"
+_scrub_cache: dict[str, bool] = {}
+_switch_cache: dict[str, bool] = {}
+
+
+def _asar_path() -> str:
+    return str(Path(app_bundle()) / "Contents" / "Resources" / "app.asar")
+
+
+def _asar_find(marker: bytes, span: int = 0) -> Optional[bytes]:
+    """The first ``span`` bytes at ``marker`` in the bundle, or None if absent.
+
+    The archive is ~40 MB, so it is mapped rather than read into a string.
+    """
+    try:
+        with open(_asar_path(), "rb") as handle:
+            with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as blob:
+                index = blob.find(marker)
+                if index < 0:
+                    return None
+                return bytes(blob[index:index + span]) if span else b""
+    except (OSError, ValueError):
+        return None
+
+
+def scrubs_user_data_dir() -> bool:
+    """True when this app build deletes CLAUDE_USER_DATA_DIR before honouring it.
+
+    Since ~1.34 (seen on 1.34493.1) the packaged app removes the variable at
+    startup unless the caller presents an Anthropic-signed CLAUDE_CDP_AUTH
+    token. On its own that no longer decides anything — ``--user-data-dir``
+    still relocates the profile, see `rejects_user_data_switch` — it only means
+    the environment alone cannot pick an account.
+    """
+    asar = _asar_path()
+    if asar not in _scrub_cache:
+        _scrub_cache[asar] = _asar_find(_SCRUB_MARKER) is not None
+    return _scrub_cache[asar]
+
+
+def rejects_user_data_switch() -> bool:
+    """True when ``--user-data-dir`` on argv would stop the app from starting.
+
+    Chromium reads that switch in C++ before a line of the app's JavaScript
+    runs, so deleting the environment variable cannot suppress it. What could
+    is the denylist the app screens ``process.argv`` against — it exits with
+    "a debugging or network-override switch is present on the command line" on
+    a match. Verified on 1.37937.3: the list holds sixteen debugging and
+    network-override switches and ``user-data-dir`` is not one of them.
+    """
+    asar = _asar_path()
+    if asar not in _switch_cache:
+        if _asar_find(_SWITCH_NAME) is None:
+            # The bundle never names the switch, so its JavaScript cannot
+            # screen it however the surrounding code is shaped.
+            rejected = False
+        else:
+            window = _asar_find(_DENYLIST_ANCHOR, _DENYLIST_SPAN) or b""
+            end = window.find(b"]")
+            rejected = _SWITCH_NAME in window[:end if end != -1 else len(window)]
+        _switch_cache[asar] = rejected
+    return _switch_cache[asar]
+
+
+def can_relocate_user_data() -> bool:
+    """Whether this build can be pointed at a per-account user-data directory.
+
+    Relocating it costs one thing, and only one: the app reports its userData
+    as moved and switches off local pairing with the Claude in Chrome browser
+    extension for that launch. Chats, sign-in and the Code tab are untouched.
+    """
+    return not rejects_user_data_switch()
+
+
 def default_app_support_dir() -> str:
     """The machine-wide user-data directory: the app's own ``~/.claude``."""
     override = os.environ.get("CLAUDE_LOGIN_APP_SUPPORT")
@@ -119,22 +207,70 @@ def sessions_root(data_dir: str, *, agent: bool = False) -> Path:
     return Path(data_dir) / (AGENT_SESSIONS_DIRNAME if agent else SESSIONS_DIRNAME)
 
 
-def session_leaf_dirs(data_dir: str, *, agent: bool = False) -> list[Path]:
-    """The ``<accountUuid>/<orgUuid>`` chat directories the app has created.
+def rejects_leaf(leaf: Path) -> bool:
+    """True when the app would refuse to write chats into this directory.
 
-    It only makes one once it has resolved both an account and an organisation,
-    so a freshly created profile has none.  That is why wiring the pool has to
-    work lazily as well as up front — the directory shows up after the login.
+    Since 1.25927 the app creates its storage directory with a hardened
+    ``mkdirPrivate``: ``mkdir -p`` and then ``open(dir, O_RDONLY|O_DIRECTORY|
+    O_NOFOLLOW)``, guarding against somebody planting a symlink under it.  On
+    macOS that flag pair answers ENOTDIR for a symlink, so a symlinked
+    ``<orgUuid>`` leaf makes every single session save fail — silently, apart
+    from a line in the app's log.
+
+    Hence the pool link lives one level up, on ``<accountUuid>``: ``O_NOFOLLOW``
+    only ever looks at the last component, and the app walks straight through
+    everything above it.
     """
+    return leaf.is_symlink()
+
+
+def _account_entries(data_dir: str, *, agent: bool = False) -> list[Path]:
+    """Everything directly under the sessions root, ours and the app's alike."""
     root = sessions_root(data_dir, agent=agent)
-    leaves: list[Path] = []
     try:
-        accounts = sorted(root.iterdir())
+        entries = sorted(root.iterdir())
     except OSError:
-        return leaves
-    for account in accounts:
-        if account.is_symlink() or not account.is_dir():
-            continue
+        return []
+    return [
+        entry
+        for entry in entries
+        if REPLACED_MARKER not in entry.name and not entry.name.startswith(".")
+    ]
+
+
+def session_account_dirs(data_dir: str, *, agent: bool = False) -> list[Path]:
+    """The ``<accountUuid>`` directories that still hold chats of their own.
+
+    A directory that is already a link into the pool is not one of them: it has
+    nothing left to fold in.  The app creates the real thing only once it has
+    resolved an account, so a freshly created profile has none — which is why
+    wiring the pool has to work lazily as well as up front.
+    """
+    return [
+        entry
+        for entry in _account_entries(data_dir, agent=agent)
+        if not entry.is_symlink() and entry.is_dir()
+    ]
+
+
+def session_account_links(data_dir: str, *, agent: bool = False) -> list[Path]:
+    """The ``<accountUuid>`` entries already pointing at the shared pool."""
+    return [
+        entry
+        for entry in _account_entries(data_dir, agent=agent)
+        if entry.is_symlink()
+    ]
+
+
+def session_leaf_dirs(data_dir: str, *, agent: bool = False) -> list[Path]:
+    """The ``<accountUuid>/<orgUuid>`` chat directories still inside ``data_dir``.
+
+    Only leaves under an account directory of its own are listed: once the
+    account is linked into the pool the leaves below it belong to the pool, not
+    to this profile.
+    """
+    leaves: list[Path] = []
+    for account in session_account_dirs(data_dir, agent=agent):
         try:
             orgs = sorted(account.iterdir())
         except OSError:
@@ -198,18 +334,37 @@ def activity(session: dict[str, Any]) -> int:
     return 0
 
 
+def chat_dirs(pool: Path) -> list[Path]:
+    """The directories a pool keeps chats in: one per organisation.
+
+    The root itself is included so that a pool written by an older version — a
+    flat pile of chat files — still reads.
+    """
+    dirs = [pool]
+    try:
+        dirs += [
+            entry
+            for entry in sorted(pool.iterdir())
+            if entry.is_dir() and not entry.name.startswith(".")
+        ]
+    except OSError:
+        pass
+    return dirs
+
+
 def sessions_in(pool: Path) -> Iterator[dict[str, Any]]:
     """Every chat in a pool directory. Non-chat files (tasks) are skipped."""
-    try:
-        entries = sorted(pool.iterdir())
-    except OSError:
-        return
-    for entry in entries:
-        if entry.suffix != ".json" or not entry.name.startswith(SESSION_PREFIX):
+    for directory in chat_dirs(pool):
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
             continue
-        session = read_session(entry)
-        if session:
-            yield session
+        for entry in entries:
+            if entry.suffix != ".json" or not entry.name.startswith(SESSION_PREFIX):
+                continue
+            session = read_session(entry)
+            if session:
+                yield session
 
 
 def last_session(pool: Path, cwd: Optional[str] = None) -> Optional[dict[str, Any]]:
@@ -254,12 +409,23 @@ def launch(data_dir: Optional[str], extra_env: Optional[dict[str, str]] = None) 
     """Start the app detached and return its pid.
 
     Not ``execve``: a window has to outlive the terminal it was started from.
-    Not ``open -a`` either — that one drops the environment we just built, and
-    the environment is how the account gets selected.
+    Not ``open -a`` either — that one drops both the environment and the argv we
+    just built, and between them they are how the account gets selected.
+
+    The account is named twice over: ``CLAUDE_USER_DATA_DIR`` for builds that
+    still honour it, and Chromium's own ``--user-data-dir`` for the ones that
+    delete the variable at startup. The switch is left off for the machine-wide
+    directory so that launch stays byte-for-byte what a Finder double-click
+    does — and so the app keeps pairing with the Chrome extension.
     """
     binary = find_app()
+    argv = [binary]
+    if data_dir and os.path.normpath(data_dir) != os.path.normpath(
+        default_app_support_dir()
+    ):
+        argv.append(f"--user-data-dir={data_dir}")
     proc = subprocess.Popen(
-        [binary],
+        argv,
         env=child_env(data_dir, extra_env),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
