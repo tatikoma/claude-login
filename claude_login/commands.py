@@ -260,9 +260,7 @@ def pending_pool_labels(vault: Vault) -> list[str]:
         return []
     pending = []
     for label, data_dir in app_data_dirs(vault):
-        if any(
-            not leaf.is_symlink() for leaf in claude_app.session_leaf_dirs(data_dir)
-        ):
+        if claude_app.session_account_dirs(data_dir):
             pending.append(label)
     return pending
 
@@ -308,9 +306,6 @@ def prepare_app_profile(vault: Vault, profile: Profile) -> tuple[str, store.Pool
     data_dir = vault.app_data_dir_for(profile)
     Path(data_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
     plan = store.PoolPlan()
-    # Resolving the org uuid may write to the registry, so it happens before the
-    # lock below — flock is not reentrant, and nesting would deadlock.
-    org_uuid = resolve_org_uuid(vault, profile) if vault.shares_chats(profile) else None
     with vault.locked():
         linked, conflicts = vault.link_app_shared(profile)
         if vault.app_per_account and not profile.is_default and not profile.app_data_dir:
@@ -323,10 +318,9 @@ def prepare_app_profile(vault: Vault, profile: Profile) -> tuple[str, store.Pool
                 plan = vault.wire_session_pool(
                     data_dir, live_account=live, sharing=vault.sharing_account_uuids()
                 )
-            if org_uuid and profile.account_uuid:
-                plan.prelinked = vault.link_session_pool(
-                    data_dir, profile.account_uuid, org_uuid
-                )
+            vault.clear_agent_pool_links(data_dir)
+            if profile.account_uuid:
+                plan.prelinked = vault.link_session_pool(data_dir, profile.account_uuid)
         vault.touch(profile.name)
         vault.save()
     if linked:
@@ -336,13 +330,77 @@ def prepare_app_profile(vault: Vault, profile: Profile) -> tuple[str, store.Pool
     return data_dir, plan
 
 
+def _profile_owning(
+    vault: Vault, account_uuid: Optional[str], *, exclude: str = ""
+) -> Optional[Profile]:
+    """The registered profile an account uuid belongs to, if any."""
+    if not account_uuid:
+        return None
+    for profile in vault.profiles:
+        if profile.name != exclude and profile.account_uuid == account_uuid:
+            return profile
+    return None
+
+
+def _window_account_mismatch(profile: Profile, status) -> Optional[str]:
+    """The account this window is signed in as, when it is knowably not ours.
+
+    The app opens as whoever its data directory is signed in as, never as the
+    picked profile — the machine-wide directory under ``default`` being the
+    usual offender. Unknown uuids stay quiet: a fresh directory just asks for
+    a sign-in.
+    """
+    if not (status.signed_in and status.account_uuid and profile.account_uuid):
+        return None
+    return status.account_uuid if status.account_uuid != profile.account_uuid else None
+
+
+def _allow_foreign_window(
+    vault: Vault, profile: Profile, foreign: str, *, assume_yes: bool
+) -> None:
+    """Fronting somebody else's chats takes an explicit yes, not a warning."""
+    owner = _profile_owning(vault, foreign)
+    ui.warn(
+        f"this app profile is signed in as {owner.display if owner else foreign}, "
+        f"not {profile.email or profile.name}"
+    )
+    if ui.confirm("open that window anyway?", assume_yes=assume_yes):
+        return
+    wanted = _profile_owning(vault, profile.account_uuid, exclude=profile.name)
+    # A build that strips CLAUDE_USER_DATA_DIR would refuse the suggested launch
+    # too, so pointing at it would send the user in a circle.
+    if wanted and not claude_app.scrubs_user_data_dir():
+        hint = f"run `claude-login {wanted.name} --app` to open {wanted.email or wanted.name}"
+    else:
+        hint = f"run `claude-login use --yes {profile.name} --app` to open it anyway"
+    raise ClaudeAppError(f"not opening a window signed in as another account — {hint}")
+
+
 def launch_app(vault: Vault, profile: Profile, args) -> int:
     """Start the desktop app under this account and return its pid."""
     claude_app.find_app()
-    data_dir, plan = prepare_app_profile(vault, profile)
-    status = claude_app.app_status(data_dir)
-
     ui.step(f"{ui.paint(profile.display, 'bold')}  {ui.paint(describe(profile), 'grey')}")
+    data_dir = vault.app_data_dir_for(profile)
+    machine = claude_app.default_app_support_dir()
+    if os.path.normpath(data_dir) != os.path.normpath(
+        machine
+    ) and not claude_app.can_relocate_user_data():
+        # Nothing would relocate the profile, so Chromium's singleton would front
+        # whatever machine-wide window is already open — the opposite of picking
+        # an account. Refusing is the only honest move.
+        raise ClaudeAppError(
+            "this Claude app build refuses to start with --user-data-dir on the "
+            "command line, so a per-account window cannot open — the machine-wide "
+            "profile would appear instead; sign the app in as the account you "
+            "need in that window"
+        )
+    status = claude_app.app_status(data_dir)
+    foreign = _window_account_mismatch(profile, status)
+    if foreign:
+        _allow_foreign_window(
+            vault, profile, foreign, assume_yes=getattr(args, "yes", False)
+        )
+    data_dir, plan = prepare_app_profile(vault, profile)
     ui.note(f"  CLAUDE_USER_DATA_DIR={data_dir}")
     if plan.linked:
         ui.note(f"  chats pooled: {plan.moved} moved from {plan.linked} directory(ies)")
@@ -363,16 +421,7 @@ def launch_app(vault: Vault, profile: Profile, args) -> int:
         )
     if not status.signed_in:
         ui.note("  the app asks for a sign-in once; that login is separate from the CLI's")
-    elif (
-        status.account_uuid
-        and profile.account_uuid
-        and status.account_uuid != profile.account_uuid
-    ):
-        ui.warn(
-            f"this app profile is signed in as {status.account_uuid}, "
-            f"not {profile.account_uuid}"
-        )
-    else:
+    elif not foreign:
         last = claude_app.last_session(
             vault.pool_dir(claude_app.SESSIONS_DIRNAME), cwd=os.getcwd()
         )
@@ -1289,12 +1338,13 @@ def app_data_dirs(vault: Vault) -> list[tuple[str, str]]:
 
 def _chats_state(vault: Vault, data_dir: str) -> str:
     """How this profile's chat directories relate to the shared pool."""
-    leaves = claude_app.session_leaf_dirs(data_dir)
-    if not leaves:
+    private = claude_app.session_account_dirs(data_dir)
+    shared = claude_app.session_account_links(data_dir)
+    if not private and not shared:
         return ui.paint("none yet", "grey")
-    if all(leaf.is_symlink() for leaf in leaves):
+    if not private:
         return ui.paint("shared", "green")
-    if any(leaf.is_symlink() for leaf in leaves):
+    if shared:
         return ui.paint("partly shared", "yellow")
     return ui.paint("private", "yellow")
 
@@ -1432,7 +1482,12 @@ def cmd_app_open(vault: Vault, args) -> int:
             continue
         if opened:
             time.sleep(LAUNCH_STAGGER_SECONDS)
-        launch_app(vault, vault.reload().get(profile.name), args)
+        try:
+            launch_app(vault, vault.reload().get(profile.name), args)
+        except ClaudeLoginError as exc:
+            # One window signed in as somebody else must not block the rest.
+            ui.error(str(exc))
+            continue
         opened += 1
     if not opened:
         ui.success("nothing to open — every account already has a window")
@@ -1454,21 +1509,24 @@ def cmd_app_link(vault: Vault, args) -> int:
     linked = 0
     for profile in targets:
         data_dir = vault.app_data_dir_for(profile)
-        org_uuid = resolve_org_uuid(vault, profile)
-        if not org_uuid or not profile.account_uuid:
+        if not profile.account_uuid:
             ui.warn(
-                f"{profile.display}: no organisation uuid yet — it is learnt on the "
-                "first app launch or from the API when online"
+                f"{profile.display}: no account uuid yet — it is learnt on the first "
+                "sign-in, so run `claude-login use` once"
             )
             continue
+        # Not needed to link any more, but a cached organisation uuid is what
+        # lets an older flat pool be split correctly, so warm it while we are
+        # here.  Outside the lock: flock is not reentrant and this may write.
+        resolve_org_uuid(vault, profile)
         Path(data_dir).mkdir(mode=0o700, parents=True, exist_ok=True)
         with vault.locked():
-            count = vault.link_session_pool(data_dir, profile.account_uuid, org_uuid)
+            count = vault.link_session_pool(data_dir, profile.account_uuid)
             vault.save()
         linked += count
         ui.info(
             f"{profile.display}: {'linked' if count else 'already linked'}"
-            f"  ({profile.account_uuid}/{org_uuid})"
+            f"  ({profile.account_uuid})"
         )
     if linked:
         ui.success(f"created {linked} pool link(s)")
@@ -1482,9 +1540,9 @@ def cmd_app_relink(vault: Vault, args) -> int:
     targets = [vault.resolve(named)] if named else vault.profiles
     pooling = vault.sharing_enabled
     stuck = False
+    stale_links = 0
     for profile in targets:
         data_dir = vault.app_data_dir_for(profile)
-        org_uuid = resolve_org_uuid(vault, profile) if pooling else None
         with vault.locked():
             linked, conflicts = vault.link_app_shared(
                 profile, repair=getattr(args, "force", False)
@@ -1493,8 +1551,10 @@ def cmd_app_relink(vault: Vault, args) -> int:
                 safe, live = pool_guard(data_dir)
                 if safe:
                     vault.wire_session_pool(data_dir, live_account=live)
-                if org_uuid and profile.account_uuid:
-                    vault.link_session_pool(data_dir, profile.account_uuid, org_uuid)
+                dropped, _ = vault.clear_agent_pool_links(data_dir)
+                stale_links += dropped
+                if profile.account_uuid:
+                    vault.link_session_pool(data_dir, profile.account_uuid)
             vault.save()
         ui.info(
             f"{profile.display}: {', '.join(linked) if linked else 'already up to date'}"
@@ -1512,7 +1572,14 @@ def cmd_app_relink(vault: Vault, args) -> int:
         if Path(machine).is_dir() and safe:
             with vault.locked():
                 vault.wire_session_pool(machine, live_account=machine_live)
+                dropped, _ = vault.clear_agent_pool_links(machine)
+                stale_links += dropped
                 vault.save()
+    if stale_links:
+        ui.note(
+            f"  removed {stale_links} dead pool link(s) left in agent-mode directories"
+            " — the app refuses to save anything while one is in the way"
+        )
     if stuck:
         ui.note(
             "  `claude-login app relink --force` moves those copies into"
@@ -1765,6 +1832,17 @@ def _doctor_app(vault: Vault) -> int:
     ui.info(ui.paint("Claude desktop app", "bold"))
     if claude_app.available():
         ui.info(f"  bundle          {claude_app.app_bundle()}")
+        if not claude_app.can_relocate_user_data():
+            problems += 1
+            ui.info(
+                f"  {ui.paint('app build', 'yellow')}       refuses --user-data-dir on"
+                " the command line — per-account app windows cannot open"
+            )
+        elif claude_app.scrubs_user_data_dir():
+            ui.info(
+                "  app build       ignores CLAUDE_USER_DATA_DIR; per-account windows"
+                " use --user-data-dir (Chrome extension pairing is off in them)"
+            )
     else:
         ui.info(
             f"  bundle          {ui.paint('not found', 'yellow')}"
@@ -1779,14 +1857,29 @@ def _doctor_app(vault: Vault) -> int:
         ui.info(f"  open profile    {open_dir}")
 
     for label, data_dir in app_data_dirs(vault):
-        unpooled = [
-            leaf for leaf in claude_app.session_leaf_dirs(data_dir) if not leaf.is_symlink()
-        ]
+        unpooled = claude_app.session_account_dirs(data_dir)
         if unpooled and vault.sharing_enabled:
             problems += 1
             ui.info(
                 f"  {ui.paint('not pooled', 'yellow')}      {label}: {len(unpooled)}"
                 " chat directory(ies)  (fix with `claude-login app adopt`)"
+            )
+        # A symlink where the app wants to create its own directory is not a
+        # cosmetic problem: it makes every save fail with ENOTDIR, and the only
+        # place that says so is the app's own log.
+        blocked = [
+            leaf
+            for agent in (False, True)
+            for leaf in claude_app.session_leaf_dirs(data_dir, agent=agent)
+            if claude_app.rejects_leaf(leaf)
+        ]
+        blocked += claude_app.session_account_links(data_dir, agent=True)
+        if blocked:
+            problems += 1
+            ui.info(
+                f"  {ui.paint('unwritable', 'yellow')}      {label}: {len(blocked)}"
+                " chat directory(ies) the app refuses to write to"
+                "  (fix with `claude-login app relink`)"
             )
 
     for profile in vault.profiles:
