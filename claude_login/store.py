@@ -71,7 +71,10 @@ EXPIRY_WARNING_DAYS = 3
 #: Launch targets `claude-login` knows how to hand a session over to.
 LAUNCH_TARGETS = ("cli", "app", "ask")
 
-#: Where the shared pool of app chats lives, relative to the vault root.
+#: Where the shared pool of app chats lives, relative to the vault root.  The
+#: pool keeps one directory per organisation uuid, because that is the last
+#: component of the path the app writes to and the app insists on creating that
+#: one itself (``claude_app.rejects_leaf``).
 APP_SHARED_DIRNAME = "app-shared"
 #: Only the Code tab's index is pooled.  ``local-agent-mode-sessions`` looks
 #: similar and is deliberately left alone: its leaf is not an index but a whole
@@ -133,7 +136,14 @@ class Profile:
 
     @property
     def display(self) -> str:
-        """Accounts are identified by their email; the name is just the directory."""
+        """Accounts are identified by their email; the name is just the directory.
+
+        The machine-wide login is marked: a dedicated profile can hold the very
+        same account, and two rows that read identically get the wrong one
+        picked — with the wrong app window behind it.
+        """
+        if self.email and self.is_default:
+            return f"{self.email} (default)"
         return self.email or self.name
 
     def to_json(self) -> dict[str, Any]:
@@ -514,7 +524,22 @@ class Vault:
         return profile.app_data_dir or str(self.app_dir_for(profile.name))
 
     def pool_dir(self, kind: str) -> Path:
+        """The pool's root; the chats themselves sit one level down, per organisation."""
         return self.root / APP_SHARED_DIRNAME / POOL_DIRNAMES[kind]
+
+    def app_data_paths(self) -> list[str]:
+        """Every app user-data directory in play, machine-wide one first."""
+        paths = [claude_app.default_app_support_dir()]
+        paths += [self.app_data_dir_for(profile) for profile in self.profiles]
+        seen: set[str] = set()
+        unique: list[str] = []
+        for path in paths:
+            key = os.path.normpath(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
 
     def link_shared(self, profile: Profile, *, repair: bool = False) -> tuple[list[str], list[str]]:
         """Symlink shared entries from ``~/.claude`` into the profile directory.
@@ -633,34 +658,42 @@ class Vault:
         live_account: Optional[str] = None,
         sharing: Optional[set[str]] = None,
     ) -> PoolPlan:
-        """Point every ``<accountUuid>/<orgUuid>`` chat directory at one pool.
+        """Point every ``<accountUuid>`` chat directory at one shared pool.
 
         The app looks its chats up under the *current* account's uuid, which is
-        why they seem to vanish after signing in as somebody else.  Collapsing
-        every leaf directory onto a single pool makes the same Recents list show
-        up whichever account is signed in.
+        why they seem to vanish after signing in as somebody else.  Linking the
+        account directory onto a pool that holds one directory per organisation
+        makes the same Recents list show up for every account of that
+        organisation, whichever one is signed in.
 
-        A leaf only exists once the app has resolved an account, so this is the
-        lazy path too: call it again later and whatever the app created in the
-        meantime is folded in.
+        The link sits on the account and not on the ``<orgUuid>`` leaf below it
+        because the app refuses to write through a symlinked leaf — see
+        ``claude_app.rejects_leaf``.  Which also means accounts of *different*
+        organisations cannot be merged at all: their last path component differs,
+        and only the app may create it.
+
+        A directory only exists once the app has resolved an account, so this is
+        the lazy path too: call it again later and whatever the app created in
+        the meantime is folded in.
 
         ``live_account`` names the account a window is signed in as right now.
-        Its leaf is the only one the app writes to, so that one is folded in with
-        the copy-then-swap dance rather than moved; everything else in the same
-        directory is dormant and moves outright.
+        Its directory is the only one the app writes to, so that one is folded in
+        with the copy-then-swap dance rather than moved; everything else in the
+        same data directory is dormant and moves outright.
 
         ``sharing`` limits the pool to a set of account uuids; ``None`` lets all
-        of them in.  The filter is per leaf rather than per directory because one
-        data directory can hold leaves of several accounts.
+        of them in.  The filter is per account directory because one data
+        directory can hold the directories of several accounts.
         """
         plan = PoolPlan()
+        if not dry_run:
+            self.migrate_flat_pool()
         for kind in POOL_DIRNAMES:
             agent = kind == claude_app.AGENT_SESSIONS_DIRNAME
             pending = [
-                leaf
-                for leaf in claude_app.session_leaf_dirs(data_dir, agent=agent)
-                if not leaf.is_symlink()
-                and (sharing is None or leaf.parent.name in sharing)
+                account
+                for account in claude_app.session_account_dirs(data_dir, agent=agent)
+                if sharing is None or account.name in sharing
             ]
             if not pending:
                 continue
@@ -669,28 +702,80 @@ class Vault:
             pool = self.pool_dir(kind)
             if not dry_run:
                 pool.mkdir(mode=0o700, parents=True, exist_ok=True)
-            for leaf in pending:
-                live = bool(live_account) and leaf.parent.name == live_account
+            for account in pending:
+                live = bool(live_account) and account.name == live_account
                 if dry_run:
-                    moved, collisions = self._drain_into_pool(leaf, pool, dry_run=True)
+                    moved, collisions, _ = self._drain_account(
+                        account, pool, dry_run=True
+                    )
                 elif live:
-                    moved, collisions = self._drain_live_into_pool(leaf, pool)
+                    moved, collisions = self._drain_live_into_pool(account, pool)
                     plan.live += 1
                 else:
-                    moved, collisions = self._drain_into_pool(leaf, pool, dry_run=False)
-                    leftover = sorted(p.name for p in leaf.iterdir())
+                    moved, collisions, leftover = self._drain_account(
+                        account, pool, dry_run=False
+                    )
                     if leftover:
-                        # Never delete what we did not move. A leaf holding
+                        # Never delete what we did not move. A directory holding
                         # anything but chat files is not the index we think it
                         # is, and guessing there once cost real data.
-                        plan.unmoved.extend(f"{leaf.name}/{name}" for name in leftover)
+                        plan.unmoved.extend(
+                            f"{account.name}/{name}" for name in leftover
+                        )
+                        plan.moved += moved
+                        plan.collisions += collisions
                         continue
-                    leaf.rmdir()
-                    leaf.symlink_to(pool)
+                    if not self._retire_account(account):
+                        continue
+                    account.symlink_to(pool)
                 plan.moved += moved
                 plan.collisions += collisions
                 plan.linked += 1
         return plan
+
+    def migrate_flat_pool(self) -> int:
+        """Lift a flat pool into the per-organisation layout the app now forces.
+
+        Pools written before the app started refusing symlinked leaves are one
+        directory of chat files that every account shared.  The leaf has to be a
+        real directory now, so the pool keeps one per organisation — and since a
+        chat file records nothing about which organisation it belongs to, while
+        every account has in fact been looking at the same list until now, each
+        organisation gets its own copy.  Copy first, move last: no chat is
+        removed from the old place before it exists in the new one.
+        """
+        moved = 0
+        for kind in POOL_DIRNAMES:
+            pool = self.pool_dir(kind)
+            if not pool.is_dir():
+                continue
+            stray = [entry for entry in sorted(pool.iterdir()) if entry.is_file()]
+            if not stray:
+                continue
+            targets = [pool / org for org in self._known_orgs(kind)]
+            if not targets:
+                continue
+            for target in targets:
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for entry in stray:
+                for target in targets[1:]:
+                    shutil.copy2(entry, target / entry.name)
+                shutil.move(str(entry), str(targets[0] / entry.name))
+                moved += 1
+        return moved
+
+    def _known_orgs(self, kind: str) -> list[str]:
+        """Every organisation uuid we can name: from disk first, registry second."""
+        agent = kind == claude_app.AGENT_SESSIONS_DIRNAME
+        found: list[str] = []
+        for data_dir in self.app_data_paths():
+            for leaf in claude_app.session_leaf_dirs(data_dir, agent=agent):
+                if leaf.name not in found:
+                    found.append(leaf.name)
+        for profile in self.profiles:
+            if profile.org_uuid and profile.org_uuid not in found:
+                found.append(profile.org_uuid)
+        return found
 
     def sweep_pool(self, *, dry_run: bool = False) -> int:
         """Move chats whose transcript is gone out of the shared pool.
@@ -706,57 +791,89 @@ class Vault:
         attic = self.root / APP_SHARED_DIRNAME / "orphans"
         moved = 0
         for kind in POOL_DIRNAMES:
-            pool = self.pool_dir(kind)
-            try:
-                entries = sorted(pool.iterdir())
-            except OSError:
-                continue
-            for entry in entries:
-                if entry.suffix != ".json" or not entry.name.startswith(
-                    claude_app.SESSION_PREFIX
-                ):
+            for directory in claude_app.chat_dirs(self.pool_dir(kind)):
+                try:
+                    entries = sorted(directory.iterdir())
+                except OSError:
                     continue
-                session = claude_app.read_session(entry)
-                cli_id = session.get("cliSessionId")
-                if not isinstance(cli_id, str) or cli_id in alive:
-                    continue
-                moved += 1
-                if dry_run:
-                    continue
-                attic.mkdir(mode=0o700, parents=True, exist_ok=True)
-                shutil.move(str(entry), str(attic / entry.name))
+                for entry in entries:
+                    if entry.suffix != ".json" or not entry.name.startswith(
+                        claude_app.SESSION_PREFIX
+                    ):
+                        continue
+                    session = claude_app.read_session(entry)
+                    cli_id = session.get("cliSessionId")
+                    if not isinstance(cli_id, str) or cli_id in alive:
+                        continue
+                    moved += 1
+                    if dry_run:
+                        continue
+                    attic.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    shutil.move(str(entry), str(attic / entry.name))
         return moved
 
-    def link_session_pool(self, data_dir: str, account_uuid: str, org_uuid: str) -> int:
-        """Create the ``<accountUuid>/<orgUuid>`` links before the app does.
+    def link_session_pool(self, data_dir: str, account_uuid: str) -> int:
+        """Link an account into the pool before the app has looked.
 
-        The app makes that directory only once it has resolved an account — which
-        happens after a login, long after we have exec'd away — so waiting for it
-        to appear means a fresh profile comes up with an empty Recents list and
-        no obvious moment when it starts sharing.  Knowing both uuids lets the
-        link exist before the app ever looks.
+        The app makes its chat directory only once it has resolved an account —
+        which happens after a login, long after we have exec'd away — so waiting
+        for it to appear means a fresh profile comes up with an empty Recents
+        list and no obvious moment when it starts sharing.  The account uuid is
+        the whole key: the organisation directory below it is the app's to
+        create, and it creates it inside the pool.
 
-        Directories that are already real are left alone: folding their contents
-        in is ``wire_session_pool``'s job, and it knows how to back them up.
+        A directory that is already real is left alone: folding its contents in
+        is ``wire_session_pool``'s job, and it knows how to back them up.
         """
-        if not account_uuid or not org_uuid:
+        if not account_uuid:
             return 0
+        self.migrate_flat_pool()
         linked = 0
         for kind in POOL_DIRNAMES:
             agent = kind == claude_app.AGENT_SESSIONS_DIRNAME
             root = claude_app.sessions_root(data_dir, agent=agent)
-            leaf = root / account_uuid / org_uuid
-            if leaf.is_symlink() or leaf.exists():
+            link = root / account_uuid
+            if link.is_symlink() or link.exists():
                 continue
             pool = self.pool_dir(kind)
             pool.mkdir(mode=0o700, parents=True, exist_ok=True)
-            leaf.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
             try:
-                leaf.symlink_to(pool)
+                link.symlink_to(pool)
             except OSError:
                 continue
             linked += 1
         return linked
+
+    def clear_agent_pool_links(self, data_dir: str) -> tuple[int, int]:
+        """Drop pool links an earlier version left in the agent-mode directories.
+
+        Agent-mode is not pooled any more — its leaf is a whole workspace, not an
+        index — but the links that experiment created are still on disk, and now
+        they do more than nothing: the app refuses a symlinked chat directory
+        outright, so agent-mode saves nothing at all while one is in the way.
+
+        Only links that point nowhere are removed; those still hold no data of
+        their own.  One that resolves is counted and left for a human.
+        """
+        removed = kept = 0
+        candidates = list(claude_app.session_account_links(data_dir, agent=True))
+        for account in claude_app.session_account_dirs(data_dir, agent=True):
+            try:
+                candidates += [org for org in sorted(account.iterdir()) if org.is_symlink()]
+            except OSError:
+                continue
+        for link in candidates:
+            if link.exists():
+                kept += 1
+                continue
+            try:
+                link.unlink()
+            except OSError:
+                kept += 1
+                continue
+            removed += 1
+        return removed, kept
 
     def known_org_uuids(self, data_dir: str, account_uuid: str) -> list[str]:
         """Organisation uuids this account already has a chat directory under.
@@ -779,15 +896,17 @@ class Vault:
         for kind in POOL_DIRNAMES:
             agent = kind == claude_app.AGENT_SESSIONS_DIRNAME
             pool = self.pool_dir(kind)
-            for leaf in claude_app.session_leaf_dirs(data_dir, agent=agent):
-                if not leaf.is_symlink():
-                    continue
-                leaf.unlink()
-                leaf.mkdir(mode=0o700, parents=True, exist_ok=True)
-                if pool.is_dir():
-                    for entry in pool.iterdir():
+            for link in claude_app.session_account_links(data_dir, agent=agent):
+                link.unlink()
+                link.mkdir(mode=0o700, parents=True, exist_ok=True)
+                for org in claude_app.chat_dirs(pool):
+                    if org == pool:
+                        continue
+                    destination = link / org.name
+                    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    for entry in org.iterdir():
                         if entry.is_file():
-                            shutil.copy2(entry, leaf / entry.name)
+                            shutil.copy2(entry, destination / entry.name)
                 restored += 1
         return restored
 
@@ -853,7 +972,96 @@ class Vault:
                 continue
         return copied, collisions
 
-    def _drain_live_into_pool(self, leaf: Path, pool: Path) -> tuple[int, int]:
+    def _drain_account(
+        self, account: Path, pool: Path, *, dry_run: bool
+    ) -> tuple[int, int, list[str]]:
+        """Move one account's chats into the pool, one organisation at a time.
+
+        A stale ``<orgUuid>`` link from the layout we used before the app began
+        refusing them holds nothing of its own — whatever it pointed at is in the
+        pool already — so it just goes.  Anything that is not a chat file stays
+        exactly where it is and comes back in the leftover list.
+        """
+        moved = collisions = 0
+        leftover: list[str] = []
+        try:
+            entries = sorted(account.iterdir())
+        except OSError:
+            return 0, 0, []
+        for org in entries:
+            if org.is_symlink():
+                if not dry_run:
+                    org.unlink()
+                continue
+            if org.name.startswith(".") or claude_app.REPLACED_MARKER in org.name:
+                # Our own backup from an earlier fold-in, or a dotfile. It is not
+                # data to move and not a reason to refuse either: ``_retire_account``
+                # carries it along instead of deleting it.
+                continue
+            if not org.is_dir():
+                leftover.append(org.name)
+                continue
+            target = pool / org.name
+            if not dry_run:
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            grabbed, clashed = self._drain_into_pool(org, target, dry_run=dry_run)
+            moved += grabbed
+            collisions += clashed
+            if dry_run:
+                continue
+            rest = sorted(p.name for p in org.iterdir())
+            if rest:
+                leftover.extend(f"{org.name}/{name}" for name in rest)
+            else:
+                org.rmdir()
+        return moved, collisions, leftover
+
+    @staticmethod
+    def _retire_account(account: Path) -> bool:
+        """Clear the account directory's name for the link, deleting nothing.
+
+        Empty means the drain took everything, so the directory itself goes.
+        Otherwise what is left is ours — an older ``.replaced-`` backup from a
+        previous fold-in, a dotfile — and the whole directory is renamed aside
+        rather than emptied: this must never remove something it did not move.
+        """
+        try:
+            account.rmdir()
+            return True
+        except OSError:
+            pass
+        aside = account.with_name(
+            f"{account.name}{claude_app.REPLACED_MARKER}{ui.now_ms()}"
+        )
+        try:
+            account.rename(aside)
+        except OSError:
+            return False
+        return True
+
+    def _copy_account_into_pool(self, account: Path, pool: Path) -> tuple[int, int]:
+        """``_drain_account`` without the removals, for a directory in use."""
+        copied = collisions = 0
+        try:
+            entries = sorted(account.iterdir())
+        except OSError:
+            return 0, 0
+        for org in entries:
+            if (
+                org.is_symlink()
+                or not org.is_dir()
+                or org.name.startswith(".")
+                or claude_app.REPLACED_MARKER in org.name
+            ):
+                continue
+            target = pool / org.name
+            target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            grabbed, clashed = self._copy_into_pool(org, target)
+            copied += grabbed
+            collisions += clashed
+        return copied, collisions
+
+    def _drain_live_into_pool(self, account: Path, pool: Path) -> tuple[int, int]:
         """Fold a directory the app is writing to *right now* into the pool.
 
         Copy first, then swap the directory for the symlink in two syscalls, then
@@ -865,11 +1073,13 @@ class Vault:
         somebody to quit the window they are working in — and that is a worse
         trade than a sub-millisecond race that cannot lose data.
         """
-        copied, collisions = self._copy_into_pool(leaf, pool)
-        aside = leaf.with_name(f"{leaf.name}{claude_app.REPLACED_MARKER}{ui.now_ms()}")
-        leaf.rename(aside)
-        leaf.symlink_to(pool)
-        late, more = self._copy_into_pool(aside, pool)
+        copied, collisions = self._copy_account_into_pool(account, pool)
+        aside = account.with_name(
+            f"{account.name}{claude_app.REPLACED_MARKER}{ui.now_ms()}"
+        )
+        account.rename(aside)
+        account.symlink_to(pool)
+        late, more = self._copy_account_into_pool(aside, pool)
         return copied + late, collisions + more
 
     @staticmethod
