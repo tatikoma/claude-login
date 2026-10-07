@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "claude-login"
 version = "1.0.0"
-description = "Switch between multiple Claude Code accounts from one terminal"
+description = "Local account manager for switching between Claude Code identities owned by the same user"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
